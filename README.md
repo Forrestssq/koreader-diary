@@ -1,7 +1,7 @@
 # diary.koplugin
 
 KOReader 日记插件。为越狱 Kindle Paperwhite 4（固件 5.18.1）、KOReader
-v2026.03 编写；接口按该版本源码实测，不凭记忆。仅依赖 KOReader 自带模块，
+v2026.03 编写；接口按该版本源码实测。仅依赖 KOReader 自带模块，
 Lua 5.1（LuaJIT）。
 
 ## 功能
