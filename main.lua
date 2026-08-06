@@ -4,13 +4,14 @@
 功能：
   1. 写日记：弹出全屏多行输入框，保存时把正文按秒级时间戳追加写入当天
      的 Markdown 文件（双指下滑可直接退出输入框，不保存）。
-  2. 回顾日记：全屏列表按日期倒序列出全部日记（带多行摘要），点开后进入
-     全屏分页浏览器，可一直往前/往后翻。每页几则、以及「一则」按天还是
-     按单条时间戳记录，均可在设置里选。
+  2. 回顾日记：全屏列表按时间倒序逐条列出全部日记（带多行摘要），长按一条
+     可选「编辑」或「生成二维码」；点开后进入全屏分页浏览器，一天一页，
+     可一直往前/往后翻。
   3. 日历查看：按月份的日历网格浏览，有日记的日子可点开查看。
   4. 连续记日记天数：统计当前连续天数、历史最长与累计天数。
-  5. 每日提醒：可开关，到设定时点弹窗提醒写日记（弹窗内直接带写入口）。
-     若到点时 KOReader 没开着，下次打开时补弹；一天最多提醒一次。
+  5. 每日提醒：可开关，可设多个时间点，到点弹窗提醒写日记（弹窗内直接带写
+     入口）。若到点时 KOReader 没开着，下次打开时补弹；每个时间点一天只弹
+     一次，另可选「今天已写过则不提醒」「一天最多提醒一次」。
 
 面向 KOReader v2026.03，Lua 5.1（LuaJIT）。仅依赖 KOReader 自带模块。
 所有接口均按 v2026.03 源码实际签名编写：
@@ -28,6 +29,7 @@
   - ui/widget/confirmbox         {text=, ok_text=, ok_callback=, cancel_text=}
   - ui/widget/datetimewidget     只传 hour/min 即为时分选择器；OK 回调收到 widget 本身
   - ui/widget/infomessage        {text=, timeout=}
+  - ui/widget/qrmessage          {text=, width=, height=}；自带点击/按键关闭
   - ui/widget/container/widgetcontainer  :extend{}
   - libs/libkoreader-lfs         lfs.attributes / lfs.mkdir / lfs.dir
   - apps/filemanager/filemanagerutil     getDefaultDir()
@@ -49,6 +51,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local LuaSettings = require("luasettings")
 local Menu = require("ui/widget/menu")
+local QRMessage = require("ui/widget/qrmessage")
 local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -66,23 +69,35 @@ local SUMMARY_MAX_LINES = 4
 local SUMMARY_MAX_CHARS = 60
 -- 「改哪一条？」列表里每行摘要的字数上限（按钮是单行的，得短一些）
 local PICKER_MAX_CHARS = 14
--- 分页浏览器里「则」与「则」之间的分隔线
-local UNIT_SEPARATOR = "\n\n────────────────\n\n"
 -- 补弹提醒的延时：启动瞬间界面还在铺，稍等一下再弹
 local CATCHUP_DELAY = 3
+-- QR 码 8-bit 模式的容量上限是 2953 字节，留一点余量。
+local QR_MAX_BYTES = 2900
 
 -------------------------------------------------------------------------------
 -- 设置（模块级单例：插件在 FileManager ↔ ReaderUI 之间会被重新实例化）
 -------------------------------------------------------------------------------
 
 local DEFAULTS = {
-    page_unit = "day",          -- "day"：一天一则；"record"：一条时间戳记录一则
-    units_per_page = 1,         -- 每页显示几则
     reminder_enabled = false,
+    -- reminder_hour / reminder_min：1.3 及以前的单个提醒时间，只用于迁移
     reminder_hour = 21,
     reminder_min = 0,
+    -- reminder_times：{ {hour=,min=}, ... }，升序去重；由 getReminderTimes 负责迁移
     reminder_skip_if_written = true, -- 今天已写过则静默跳过
-    -- last_reminded_date：字符串 "YYYY-MM-DD"，无默认值
+    reminder_once_per_day = false,   -- 一天弹过一次之后，剩下的时间点都不再弹
+    -- reminder_last：{ ["21:00"] = "YYYY-MM-DD" }，每个时间点各记各的
+    export_range = "all",       -- all / 7d / 30d / month / custom
+    -- export_from / export_to：字符串 "YYYY-MM-DD"，仅 custom 用
+}
+
+-- 导出范围的可选项（顺序即菜单顺序）
+local EXPORT_RANGES = {
+    { id = "all",    label = _("全部") },
+    { id = "7d",     label = _("最近 7 天") },
+    { id = "30d",    label = _("最近 30 天") },
+    { id = "month",  label = _("本月") },
+    { id = "custom", label = _("自定义日期") },
 }
 
 local diary_store
@@ -105,6 +120,32 @@ end
 local function setSetting(key, value)
     getStore():saveSetting(key, value)
     getStore():flush()
+end
+
+-------------------------------------------------------------------------------
+-- 日期时间选择器
+--
+-- VirtualKeyboard 是 modal 的，DateTimeWidget 默认不是。UIManager:show 的窗口栈
+-- 规则是「非 modal 的一律插到 modal 之下」，所以在输入框里弹选择器时，它会被压
+-- 在键盘底下——既看不见，事件也拿不到（sendEvent 只发给栈顶那个非 toast 窗口），
+-- 于是整个界面像卡住一样。两手一起解决：
+--   1) modal = true，进到键盘上面那一层。ConfirmBox / InfoMessage 本来就是
+--      modal，所以删除确认之类一直是好的。
+--   2) 弹出前收起键盘、关掉后再放回来。光有 modal 的话键盘还杵在后面，很乱。
+--      收放键盘不重建对话框，比 InputDialog:toggleKeyboard 轻得多——后者会
+--      onClose + free + init 整个重来，而且硬依赖一个 id="keyboard" 的按钮。
+-------------------------------------------------------------------------------
+
+local DiaryDateTime = DateTimeWidget:extend{
+    modal = true,
+}
+
+function DiaryDateTime:onCloseWidget()
+    -- 「确定」「取消」、点窗外、按返回键都会走到这里，键盘一定放得回来
+    if self.on_dismiss then
+        self.on_dismiss()
+    end
+    return DateTimeWidget.onCloseWidget(self)
 end
 
 -------------------------------------------------------------------------------
@@ -217,6 +258,24 @@ local function stripHardBreaks(text)
     return table.concat(lines, "\n")
 end
 
+-- 先写临时文件再 rename。同一目录下 rename 是原子的，中途掉电不会留下半截文件。
+local function writeFileAtomic(path, content)
+    local tmp_path = path .. ".tmp"
+    local f, ferr = io.open(tmp_path, "w")
+    if not f then
+        return false, ferr
+    end
+    f:write(content)
+    f:close()
+
+    local ok, rerr = os.rename(tmp_path, path)
+    if not ok then
+        os.remove(tmp_path)
+        return false, rerr
+    end
+    return true, path
+end
+
 -- 一天之内的记录必须按时间正序存放：显示顺序和 rec_index 都依赖这个顺序。
 local function insertSorted(records, rec)
     local pos = #records + 1
@@ -244,13 +303,17 @@ local Diary = WidgetContainer:extend{
     is_doc_only = false, -- 在 FileManager 和 ReaderUI 两侧都加载
 }
 
--- diary 目录：home directory 下的 diary 子目录。
-function Diary:getDiaryDir()
+function Diary:getHomeDir()
     local home = G_reader_settings:readSetting("home_dir")
     if not home then
         home = filemanagerutil.getDefaultDir()
     end
-    return home .. "/diary"
+    return home
+end
+
+-- diary 目录：home directory 下的 diary 子目录。
+function Diary:getDiaryDir()
+    return self:getHomeDir() .. "/diary"
 end
 
 function Diary:getEntryPath(date_str)
@@ -374,20 +437,7 @@ function Diary:writeDayRecords(date_str, records)
         parts[#parts + 1] = addHardBreaks(rec.text) .. "\n\n"
     end
 
-    local tmp_path = path .. ".tmp"
-    local f, ferr = io.open(tmp_path, "w")
-    if not f then
-        return false, ferr
-    end
-    f:write(table.concat(parts))
-    f:close()
-
-    local ok, rerr = os.rename(tmp_path, path)
-    if not ok then
-        os.remove(tmp_path)
-        return false, rerr
-    end
-    return true, path
+    return writeFileAtomic(path, table.concat(parts))
 end
 
 -- 删除某天第 rec_index 条记录；删完当天没有记录了就把文件也删掉。
@@ -403,7 +453,7 @@ end
 -- 输入框是「写今天的新条目」还是「改某条旧记录」，由 self.edit_index 决定：
 --   0        → 新条目（写入今天）
 --   1..#N    → 正在改 self.edit_units[edit_index] 这条
--- edit_units 是 record 粒度、日期倒序的，所以 ◀ 是往更早翻，▶ 是往更新翻。
+-- edit_units 是 record 粒度、严格时间倒序的，所以 ◀ 是往更早翻，▶ 是往更新翻。
 
 function Diary:saveCurrentInput()
     if not self.diary_input then
@@ -568,7 +618,15 @@ end
 
 function Diary:showStampDialog()
     local stamp = self.edit_stamp
-    UIManager:show(DateTimeWidget:new{
+    local dialog = self.diary_input
+
+    -- 先把键盘收起来，别让它挡着选择器（详见 DiaryDateTime 上面那段说明）
+    local restore_keyboard = dialog and dialog:isKeyboardVisible()
+    if restore_keyboard then
+        dialog:onCloseKeyboard()
+    end
+
+    UIManager:show(DiaryDateTime:new{
         year = stamp.year,
         month = stamp.month,
         day = stamp.day,
@@ -590,6 +648,15 @@ function Diary:showStampDialog()
             if self.diary_input then
                 self.diary_input:refreshButtons()
             end
+        end,
+        on_dismiss = function()
+            if not restore_keyboard then return end
+            -- 等这个窗口真的从栈上摘掉了再放键盘，免得两边同时改窗口栈
+            UIManager:nextTick(function()
+                if self.diary_input then
+                    self.diary_input:onShowKeyboard()
+                end
+            end)
         end,
     })
 end
@@ -775,43 +842,36 @@ local function renderRecords(records)
     return table.concat(parts, "\n\n")
 end
 
--- 回顾列表用：一次读取拿到「多行摘要」和「记录条数」。
-function Diary:readEntrySummary(date_str)
-    local records = self:parseDayRecords(date_str)
-    if not records then
-        return "", 0
-    end
+-- 回顾列表用的多行摘要：取前若干非空行，每行再截短。
+local function summarizeText(text)
     local lines = {}
-    for _idx = 1, #records do
-        for line in (records[_idx].text .. "\n"):gmatch("([^\n]*)\n") do
-            local t = trim(line)
-            if t ~= "" then
-                lines[#lines + 1] = truncateChars(t, SUMMARY_MAX_CHARS)
-                if #lines >= SUMMARY_MAX_LINES then
-                    return table.concat(lines, "\n"), #records
-                end
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        local t = trim(line)
+        if t ~= "" then
+            lines[#lines + 1] = truncateChars(t, SUMMARY_MAX_CHARS)
+            if #lines >= SUMMARY_MAX_LINES then
+                break
             end
         end
     end
-    return table.concat(lines, "\n"), #records
+    return table.concat(lines, "\n")
 end
 
 -------------------------------------------------------------------------------
 -- 2) 回顾日记：全屏列表（多行摘要） → 全屏分页浏览器
 -------------------------------------------------------------------------------
 
--- 按当前「分页单位」设置，生成倒序的「则」数组。
---   "day"    ：一天一则，正文延后到真正要显示时才读（见 unitText）
---   "record" ：一条时间戳记录一则，必须先全部解析才能知道总数
--- record 粒度的单元数组（日期倒序，同一天内时间正序）。
--- rec_index 是它在 parseDayRecords 结果里的下标，改写/删除要用。
+-- record 粒度的单元数组，严格按时间倒序（同一天内也是最新的在前）。
+-- 回顾列表和编辑器都以它为准：列表里一项就是这里的一个单元，下标直接通用；
+-- 编辑器的 ◀ 往下标大的走，也就是一路往更早翻。
+-- rec_index 是它在 parseDayRecords 结果里的下标（那边是正序的），改写/删除要用。
 function Diary:getRecordUnits(list)
     list = list or self:collectEntries()
     local units = {}
     for _idx = 1, #list do
         local date_str = list[_idx].str
         local records = self:parseDayRecords(date_str) or {}
-        for r = 1, #records do
+        for r = #records, 1, -1 do
             units[#units + 1] = {
                 date = date_str,
                 rec_index = r,
@@ -824,11 +884,9 @@ function Diary:getRecordUnits(list)
     return units
 end
 
+-- 分页浏览器用的单元数组：一天一则（日期倒序）。
 function Diary:getUnits()
     local list = self:collectEntries()
-    if getSetting("page_unit") == "record" then
-        return self:getRecordUnits(list)
-    end
     local units = {}
     for _idx = 1, #list do
         local date_str = list[_idx].str
@@ -837,7 +895,7 @@ function Diary:getUnits()
     return units
 end
 
--- 惰性取一则的正文（"day" 模式下第一次访问时才读文件）。
+-- 惰性取一天的正文（第一次访问时才读文件）。
 function Diary:unitText(unit)
     if not unit.text then
         unit.text = renderRecords(self:parseDayRecords(unit.date) or {})
@@ -845,35 +903,38 @@ function Diary:unitText(unit)
     return unit.text
 end
 
-function Diary:buildReviewItems(list)
+-- 一条记录一项。units 就是 getRecordUnits() 的结果，item.unit_index 与之对应，
+-- 编辑时可以原样传给 showEntryDialog。
+function Diary:buildReviewItems(units)
     local item_table = {}
-    for idx = 1, #list do
-        local date_str = list[idx].str
-        local summary, count = self:readEntrySummary(date_str)
+    for idx = 1, #units do
+        local unit = units[idx]
+        local summary = summarizeText(unit.text)
         -- Menu 会把条目文本里的 \n 换成空格（menu.lua:211），所以摘要在这里
-        -- 是一整段回流的文字；日期后面加个 · 把它和正文分开。
+        -- 是一整段回流的文字；标题后面加个 · 把它和正文分开。
         item_table[#item_table + 1] = {
-            text = summary ~= "" and (date_str .. "  ·  " .. summary) or date_str,
-            mandatory = string.format(_("%d 条"), count),
-            date = date_str,
+            text = summary ~= "" and (unit.title .. "  ·  " .. summary) or unit.title,
+            date = unit.date,
+            unit_index = idx,
         }
     end
     return item_table
 end
 
 function Diary:showReview()
-    local list = self:collectEntries()
-    if #list == 0 then
+    local units = self:getRecordUnits()
+    if #units == 0 then
         UIManager:show(InfoMessage:new{
             text = _("还没有任何日记。"),
         })
         return
     end
-    local item_table = self:buildReviewItems(list)
+    self.review_units = units
+    local item_table = self:buildReviewItems(units)
 
     self.review_menu = Menu:new{
         name = "diary_review",
-        title = string.format(_("回顾日记（共 %d 天）"), #list),
+        title = string.format(_("回顾日记（共 %d 条）"), #units),
         item_table = item_table,
         covers_fullscreen = true,
         is_borderless = true,
@@ -890,11 +951,9 @@ function Diary:showReview()
             end
             return true
         end,
-        -- 长按某一天 → 编辑那天的记录
+        -- 长按某一条 → 问是编辑还是生成二维码
         onMenuHold = function(_menu, item)
-            if item.date then
-                self:editRecordsOfDay(item.date)
-            end
+            self:showRecordActions(item)
             return true
         end,
     }
@@ -908,7 +967,84 @@ function Diary:closeReview()
     if self.review_menu then
         UIManager:close(self.review_menu)
         self.review_menu = nil
+        self.review_units = nil
     end
+end
+
+-- 回顾列表长按一条：编辑，还是把它变成二维码带走。
+function Diary:showRecordActions(item)
+    local units = self.review_units
+    local unit = units and item.unit_index and units[item.unit_index]
+    if not unit then
+        return
+    end
+
+    local function close()
+        if self.record_action_dialog then
+            UIManager:close(self.record_action_dialog)
+            self.record_action_dialog = nil
+        end
+    end
+
+    self.record_action_dialog = ButtonDialog:new{
+        title = unit.title,
+        title_align = "center",
+        buttons = {
+            {
+                {
+                    text = _("编辑"),
+                    callback = function()
+                        close()
+                        -- showEntryDialog 会自己重建 edit_units，下标与列表一致
+                        self:showEntryDialog(item.unit_index)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("生成二维码"),
+                    callback = function()
+                        close()
+                        self:showRecordQR(unit)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("取消"),
+                    callback = close,
+                },
+            },
+        },
+    }
+    UIManager:show(self.record_action_dialog)
+end
+
+-- 只编码正文。QRWidget 自己也会截断，但它是按字节切的，中文会切出半个字符，
+-- 所以这里先按字符截到容量以内。
+function Diary:showRecordQR(unit)
+    local text = unit.text or ""
+    if #text > QR_MAX_BYTES then
+        local chars = util.splitToChars(text)
+        local kept, bytes = {}, 0
+        for i = 1, #chars do
+            bytes = bytes + #chars[i]
+            if bytes > QR_MAX_BYTES then
+                break
+            end
+            kept[i] = chars[i]
+        end
+        text = table.concat(kept)
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("内容过长，二维码只包含前 %d 字。"), #kept),
+            timeout = 3,
+        })
+    end
+    UIManager:show(QRMessage:new{
+        text = text,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+    })
 end
 
 -------------------------------------------------------------------------------
@@ -935,40 +1071,19 @@ function Diary:showPager(start_date)
         end
     end
 
-    local per_page = getSetting("units_per_page")
-    if type(per_page) ~= "number" or per_page < 1 then
-        per_page = 1
-    end
-
     self.pager_units = units
-    self.pager_per_page = per_page
-    self.pager_total_pages = math.ceil(#units / per_page)
-    self:showPagerPage(math.floor((start_index - 1) / per_page) + 1)
+    self.pager_total_pages = #units
+    self:showPagerPage(start_index)
 end
 
+-- 一天一页：第 page 页就是 pager_units[page] 那一天的全部记录。
 function Diary:showPagerPage(page)
-    local units = self.pager_units
-    local per_page = self.pager_per_page
+    local unit = self.pager_units[page]
     local total_pages = self.pager_total_pages
-    local first = (page - 1) * per_page + 1
-    local last = math.min(first + per_page - 1, #units)
     self.pager_page = page
 
-    -- 一页只有一则时标题栏已经写了日期，正文里不再重复；多则时才逐则加小标题。
-    local single = (last == first)
-    local parts = {}
-    for idx = first, last do
-        local unit = units[idx]
-        local body = self:unitText(unit)
-        parts[#parts + 1] = single and body or ("【" .. unit.title .. "】\n\n" .. body)
-    end
-
-    local title = units[first].title
-    if not single then
-        title = units[last].title .. " ~ " .. units[first].title -- 倒序，末项日期更早
-    end
     -- 页码放标题里，把中间那个按钮位让给「编辑」
-    title = string.format("%s  (%d/%d)", title, page, total_pages)
+    local title = string.format("%s  (%d/%d)", unit.title, page, total_pages)
 
     -- TextViewer 会就地把默认按钮行 insert 进 buttons_table，所以每页都要新建一张表。
     local buttons_table = {
@@ -980,7 +1095,7 @@ function Diary:showPagerPage(page)
             },
             {
                 text = _("编辑"),
-                callback = function() self:editUnitsInRange(first, last) end,
+                callback = function() self:editRecordsOfDay(unit.date) end,
             },
             {
                 text = _("下一页 ▶"),
@@ -993,7 +1108,7 @@ function Diary:showPagerPage(page)
     self.pager = TextViewer:new{
         title = title,
         title_shrink_font_to_fit = true,
-        text = table.concat(parts, UNIT_SEPARATOR),
+        text = self:unitText(unit),
         -- 真·全屏：不传宽高的话 TextViewer 默认是「屏幕 - 30px」的内缩窗口。
         width = Screen:getWidth(),
         height = Screen:getHeight(),
@@ -1083,35 +1198,7 @@ function Diary:pickRecordToEdit(matches)
     UIManager:show(self.pick_dialog)
 end
 
--- 分页浏览器：编辑当前这一页上的内容。
-function Diary:editUnitsInRange(first, last)
-    local units = self.pager_units
-    local record_units = self:getRecordUnits()
-    self.edit_pick_units = record_units
-
-    -- 按天分页时一个单元可能含多条记录，所以按日期匹配；
-    -- 按记录分页时单元本身就是记录，按 日期+rec_index 精确匹配。
-    local want_date, want_key = {}, {}
-    for idx = first, last do
-        local unit = units[idx]
-        if unit.rec_index then
-            want_key[unit.date .. "#" .. unit.rec_index] = true
-        else
-            want_date[unit.date] = true
-        end
-    end
-
-    local matches = {}
-    for idx = 1, #record_units do
-        local ru = record_units[idx]
-        if want_date[ru.date] or want_key[ru.date .. "#" .. ru.rec_index] then
-            matches[#matches + 1] = idx
-        end
-    end
-    self:pickRecordToEdit(matches)
-end
-
--- 回顾列表长按某一天：编辑那天的记录。
+-- 分页浏览器的「编辑」：这一页就是一天，落到这天的记录上。
 function Diary:editRecordsOfDay(date_str)
     local record_units = self:getRecordUnits()
     self.edit_pick_units = record_units
@@ -1127,10 +1214,11 @@ end
 -- 改过 / 删过之后，把还开着的回顾列表和分页浏览器刷新一遍，免得看到旧内容。
 function Diary:refreshOpenViews()
     if self.review_menu then
-        local list = self:collectEntries()
-        local item_table = self:buildReviewItems(list)
+        local units = self:getRecordUnits()
+        self.review_units = units
+        local item_table = self:buildReviewItems(units)
         self.review_menu:switchItemTable(
-            string.format(_("回顾日记（共 %d 天）"), #list), item_table, -1)
+            string.format(_("回顾日记（共 %d 条）"), #units), item_table, -1)
     end
     if self.pager then
         local page = self.pager_page or 1
@@ -1141,7 +1229,7 @@ function Diary:refreshOpenViews()
             UIManager:show(InfoMessage:new{ text = _("已经没有日记了。") })
             return
         end
-        self.pager_total_pages = math.ceil(#self.pager_units / self.pager_per_page)
+        self.pager_total_pages = #self.pager_units
         self:closePager()
         self:showPagerPage(math.min(page, self.pager_total_pages))
     end
@@ -1302,11 +1390,284 @@ function Diary:showStreak()
 end
 
 -------------------------------------------------------------------------------
+-- 6) 导出为一个大 Markdown 文件
+-------------------------------------------------------------------------------
+
+-- 把某天往前/往后推 n 天（正午取时刻，避开 DST 边界）。
+local function shiftDate(date_str, days)
+    local y, m, d = date_str:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
+    local t = os.time({
+        year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 12,
+    }) + days * 86400
+    return os.date("%Y-%m-%d", t)
+end
+
+local function todayDate()
+    return os.date("%Y-%m-%d")
+end
+
+-- 当前设置对应的日期区间。返回 from, to（nil 表示这一头不限）。
+function Diary:getExportRange()
+    local mode = getSetting("export_range")
+    local today = todayDate()
+    if mode == "7d" then
+        return shiftDate(today, -6), today
+    elseif mode == "30d" then
+        return shiftDate(today, -29), today
+    elseif mode == "month" then
+        return today:sub(1, 8) .. "01", today
+    elseif mode == "custom" then
+        local from, to = getSetting("export_from"), getSetting("export_to")
+        -- 顺手兜一下反着填的情况
+        if from and to and from > to then
+            from, to = to, from
+        end
+        return from, to
+    end
+    return nil, nil -- 全部
+end
+
+-- 落在区间里的日期，按时间正序（导出的文件是拿来从头读的）。
+-- ISO 日期字符串按字典序比较即是按时间比较。
+function Diary:collectEntriesInRange(from, to)
+    local list = self:collectEntries()
+    local out = {}
+    for idx = #list, 1, -1 do -- collectEntries 是倒序，反着走就是正序
+        local date_str = list[idx].str
+        if (not from or date_str >= from) and (not to or date_str <= to) then
+            out[#out + 1] = date_str
+        end
+    end
+    return out
+end
+
+function Diary:exportRangeLabel()
+    local mode = getSetting("export_range")
+    for _idx = 1, #EXPORT_RANGES do
+        if EXPORT_RANGES[_idx].id == mode then
+            return EXPORT_RANGES[_idx].label
+        end
+    end
+    return _("全部")
+end
+
+-- 自定义区间第一次用时给个像样的默认值：从最早一篇到今天。
+function Diary:ensureCustomRange()
+    if not getSetting("export_from") then
+        local list = self:collectEntries()
+        -- list 是倒序，最后一个是最早的
+        setSetting("export_from", #list > 0 and list[#list].str or todayDate())
+    end
+    if not getSetting("export_to") then
+        setSetting("export_to", todayDate())
+    end
+end
+
+function Diary:doExport()
+    -- 自定义模式下起止一定要有值，否则 getExportRange 会退化成「全部」，
+    -- 用户按了「现在导出」却导出了一切，很意外。
+    if getSetting("export_range") == "custom" then
+        self:ensureCustomRange()
+    end
+    local from, to = self:getExportRange()
+    local dates = self:collectEntriesInRange(from, to)
+    if #dates == 0 then
+        UIManager:show(InfoMessage:new{ text = _("所选范围内没有日记。") })
+        return
+    end
+
+    local parts = {
+        "# " .. _("日记导出") .. "\n\n",
+        string.format(_("范围：%s ~ %s\n"), dates[1], dates[#dates]),
+    }
+    local range_line_idx = #parts + 1
+    parts[range_line_idx] = "" -- 占位，条数统计完再填
+    parts[#parts + 1] = string.format(_("导出时间：%s\n\n"), stampLabel(nowStamp()))
+
+    local total_records = 0
+    for _idx = 1, #dates do
+        local date_str = dates[_idx]
+        local records = self:parseDayRecords(date_str) or {}
+        parts[#parts + 1] = "---\n\n## " .. date_str .. "\n\n"
+        for r = 1, #records do
+            local rec = records[r]
+            total_records = total_records + 1
+            if rec.time then
+                parts[#parts + 1] = "### " .. rec.time .. "\n\n"
+            end
+            -- 和存储一样补上强制换行，否则导出的文件渲染时会把换行拼成一段
+            parts[#parts + 1] = addHardBreaks(rec.text) .. "\n\n"
+        end
+    end
+    parts[range_line_idx] = string.format(_("共 %d 天 / %d 条\n"), #dates, total_records)
+
+    local path = string.format("%s/diary-export-%s_%s.md",
+        self:getHomeDir(), dates[1], dates[#dates])
+    local ok, err = writeFileAtomic(path, table.concat(parts))
+    if not ok then
+        UIManager:show(InfoMessage:new{
+            text = _("导出失败：") .. tostring(err or _("未知错误")),
+        })
+        return
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = string.format(_("已导出 %d 天 / %d 条到：\n%s"), #dates, total_records, path),
+    })
+end
+
+function Diary:showExportDatePicker(key, title, touchmenu_instance)
+    self:ensureCustomRange()
+    local cur = getSetting(key)
+    local y, m, d = cur:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
+    UIManager:show(DiaryDateTime:new{
+        year = tonumber(y),
+        month = tonumber(m),
+        day = tonumber(d),
+        ok_text = _("确定"),
+        cancel_text = _("取消"),
+        title_text = title,
+        callback = function(w)
+            setSetting(key, string.format("%04d-%02d-%02d", w.year, w.month, w.day))
+            if touchmenu_instance then
+                touchmenu_instance:updateItems()
+            end
+        end,
+    })
+end
+
+function Diary:getExportMenu()
+    local range_items = {}
+    for _idx = 1, #EXPORT_RANGES do
+        local r = EXPORT_RANGES[_idx]
+        range_items[#range_items + 1] = {
+            text = r.label,
+            radio = true,
+            checked_func = function() return getSetting("export_range") == r.id end,
+            keep_menu_open = true,
+            callback = function()
+                setSetting("export_range", r.id)
+                if r.id == "custom" then
+                    self:ensureCustomRange()
+                end
+            end,
+        }
+    end
+
+    local function isCustom() return getSetting("export_range") == "custom" end
+
+    return {
+        {
+            text_func = function()
+                return string.format(_("导出范围：%s"), self:exportRangeLabel())
+            end,
+            sub_item_table = range_items,
+        },
+        {
+            text_func = function()
+                return string.format(_("起始日期：%s"), getSetting("export_from") or _("未设置"))
+            end,
+            enabled_func = isCustom,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:showExportDatePicker("export_from", _("起始日期"), touchmenu_instance)
+            end,
+        },
+        {
+            text_func = function()
+                return string.format(_("结束日期：%s"), getSetting("export_to") or _("未设置"))
+            end,
+            enabled_func = isCustom,
+            keep_menu_open = true,
+            separator = true,
+            callback = function(touchmenu_instance)
+                self:showExportDatePicker("export_to", _("结束日期"), touchmenu_instance)
+            end,
+        },
+        {
+            text_func = function()
+                local from, to = self:getExportRange()
+                return string.format(_("现在导出（%d 天）"),
+                    #self:collectEntriesInRange(from, to))
+            end,
+            keep_menu_open = true,
+            callback = function()
+                self:doExport()
+            end,
+        },
+    }
+end
+
+-------------------------------------------------------------------------------
 -- 5) 每日提醒
 -------------------------------------------------------------------------------
 
-local function reminderTimeLabel()
-    return string.format("%02d:%02d", getSetting("reminder_hour"), getSetting("reminder_min"))
+local function slotKey(slot)
+    return string.format("%02d:%02d", slot.hour, slot.min)
+end
+
+-- 时间点排序 + 去重后落盘。存进去的永远是升序的，取用的地方就不必再排。
+local function setReminderTimes(times)
+    table.sort(times, function(a, b)
+        if a.hour ~= b.hour then return a.hour < b.hour end
+        return a.min < b.min
+    end)
+    local out, seen = {}, {}
+    for idx = 1, #times do
+        local key = slotKey(times[idx])
+        if not seen[key] then
+            seen[key] = true
+            out[#out + 1] = { hour = times[idx].hour, min = times[idx].min }
+        end
+    end
+    setSetting("reminder_times", out)
+    return out
+end
+
+-- 1.3 及以前只有一个提醒时间，第一次读到时就地迁移成列表并落盘，
+-- 老用户升级后原来那个时间点照旧生效。
+local function getReminderTimes()
+    local times = getStore():readSetting("reminder_times")
+    if type(times) ~= "table" then
+        return setReminderTimes({
+            { hour = getSetting("reminder_hour"), min = getSetting("reminder_min") },
+        })
+    end
+    return times
+end
+
+local function reminderTimesLabel()
+    local times = getReminderTimes()
+    if #times == 0 then
+        return _("未设置")
+    end
+    local parts = {}
+    for idx = 1, #times do
+        parts[idx] = slotKey(times[idx])
+    end
+    return table.concat(parts, "、")
+end
+
+-- 某个时间点在「now 所在那一天」的绝对时刻。
+local function slotTarget(slot, now)
+    local t = os.date("*t", now)
+    t.hour, t.min, t.sec = slot.hour, slot.min, 0
+    return os.time(t)
+end
+
+-- 每个时间点各记各的「最后提醒日期」。
+local function getReminderLast()
+    return getStore():readSetting("reminder_last", {})
+end
+
+local function markReminded(keys, today)
+    local last = getReminderLast()
+    for idx = 1, #keys do
+        last[keys[idx]] = today
+    end
+    -- readSetting 返回的就是存在设置表里的那张表，改完 flush 即落盘
+    getStore():saveSetting("reminder_last", last)
+    getStore():flush()
 end
 
 -- 重排下一次提醒。开关、时间、跳过策略任一改动后都要重调。
@@ -1318,36 +1679,69 @@ function Diary:scheduleReminder()
     if not getSetting("reminder_enabled") then
         return
     end
+    local times = getReminderTimes()
+    if #times == 0 then
+        return
+    end
 
     local now = os.time()
-    local t = os.date("*t", now)
-    t.hour = getSetting("reminder_hour")
-    t.min = getSetting("reminder_min")
-    t.sec = 0
-    local target = os.time(t)
     local today = os.date("%Y-%m-%d", now)
+    local last = getReminderLast()
 
-    if now >= target then
-        if getSetting("last_reminded_date") ~= today then
-            -- 到点时 KOReader 没开着 → 现在补弹一次。
-            UIManager:scheduleIn(CATCHUP_DELAY, self.reminder_cb)
-            return
+    local next_target
+    for idx = 1, #times do
+        local target = slotTarget(times[idx], now)
+        if now >= target then
+            if last[slotKey(times[idx])] ~= today then
+                -- 到点时 KOReader 没开着 → 现在补弹一次。
+                UIManager:scheduleIn(CATCHUP_DELAY, self.reminder_cb)
+                return
+            end
+        elseif not next_target or target < next_target then
+            next_target = target
         end
-        -- 今天已经提醒过了，排到明天（day+1 交给 os.time 归一化跨月/跨年）。
-        t.day = t.day + 1
-        target = os.time(t)
     end
-    UIManager:scheduleIn(math.max(target - now, 1), self.reminder_cb)
+
+    if not next_target then
+        -- 今天的都过完了，排到明天最早的那个（day+1 交给 os.time 归一化跨月/跨年）。
+        local t = os.date("*t", now)
+        t.day = t.day + 1
+        t.hour, t.min, t.sec = times[1].hour, times[1].min, 0
+        next_target = os.time(t)
+    end
+    UIManager:scheduleIn(math.max(next_target - now, 1), self.reminder_cb)
 end
 
 function Diary:fireReminder()
-    -- 先落盘：这把锁同时保证「一天只弹一次」「FM/Reader 两个实例不重复弹」
-    -- 「补弹只补一次」。
-    local today = os.date("%Y-%m-%d")
-    setSetting("last_reminded_date", today)
+    local now = os.time()
+    local today = os.date("%Y-%m-%d", now)
+    local last = getReminderLast()
+
+    -- 打标记之前先看今天是不是已经弹过了——「一天最多提醒一次」要用它。
+    local already_fired_today = false
+    for _key, date_str in pairs(last) do
+        if date_str == today then
+            already_fired_today = true
+            break
+        end
+    end
+
+    local due = {}
+    local times = getReminderTimes()
+    for idx = 1, #times do
+        local key = slotKey(times[idx])
+        if now >= slotTarget(times[idx], now) and last[key] ~= today then
+            due[#due + 1] = key
+        end
+    end
+    -- 先落盘：这把锁同时保证「每个时间点一天只弹一次」「FM/Reader 两个实例不
+    -- 重复弹」「补弹只补一次」。
+    markReminded(due, today)
 
     local written = lfs.attributes(self:getEntryPath(today), "mode") ~= nil
-    if not (getSetting("reminder_skip_if_written") and written) then
+    local muted = (getSetting("reminder_skip_if_written") and written)
+        or (getSetting("reminder_once_per_day") and already_fired_today)
+    if #due > 0 and not muted then
         UIManager:show(ConfirmBox:new{
             text = _("该写日记了。"),
             ok_text = _("现在写"),
@@ -1358,27 +1752,34 @@ function Diary:fireReminder()
         })
     end
 
-    self:scheduleReminder() -- 排到明天
+    self:scheduleReminder() -- 排下一个时间点 / 明天
 end
 
-function Diary:showReminderTimeDialog(touchmenu_instance)
-    UIManager:show(DateTimeWidget:new{
-        hour = getSetting("reminder_hour"),
-        min = getSetting("reminder_min"),
+-- 时分选择器。slot 为 nil 表示新增一个时间点；否则是改 slot_index 这一个。
+function Diary:showReminderTimeDialog(touchmenu_instance, slot_index)
+    local times = getReminderTimes()
+    local slot = slot_index and times[slot_index]
+    UIManager:show(DiaryDateTime:new{
+        hour = slot and slot.hour or 21,
+        min = slot and slot.min or 0,
         ok_text = _("设置"),
         cancel_text = _("取消"),
-        title_text = _("提醒时间"),
+        title_text = slot and _("修改提醒时间") or _("添加提醒时间"),
         info_text = _("选择每天提醒写日记的时间。"),
         -- OK 时 DateTimeWidget 是以 self:callback(self) 调用的，读 w.hour / w.min。
         callback = function(w)
-            setSetting("reminder_hour", w.hour)
-            setSetting("reminder_min", w.min)
+            local updated = getReminderTimes()
+            if slot_index then
+                updated[slot_index] = { hour = w.hour, min = w.min }
+            else
+                updated[#updated + 1] = { hour = w.hour, min = w.min }
+            end
+            setReminderTimes(updated)
             -- 刚设的时间若今天已经过了，别立刻弹；从明天开始。
             local now = os.time()
-            local t = os.date("*t", now)
-            t.hour, t.min, t.sec = w.hour, w.min, 0
-            if now >= os.time(t) then
-                setSetting("last_reminded_date", os.date("%Y-%m-%d", now))
+            local new_slot = { hour = w.hour, min = w.min }
+            if now >= slotTarget(new_slot, now) then
+                markReminded({ slotKey(new_slot) }, os.date("%Y-%m-%d", now))
             end
             self:scheduleReminder()
             if touchmenu_instance then
@@ -1386,6 +1787,48 @@ function Diary:showReminderTimeDialog(touchmenu_instance)
             end
         end,
     })
+end
+
+function Diary:getReminderTimesMenu()
+    local times = getReminderTimes()
+    local items = {}
+    for idx = 1, #times do
+        local slot_index = idx
+        items[#items + 1] = {
+            text = slotKey(times[idx]),
+            mandatory = _("长按删除"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:showReminderTimeDialog(touchmenu_instance, slot_index)
+            end,
+            hold_callback = function(touchmenu_instance)
+                local current = getReminderTimes()
+                local victim = current[slot_index]
+                if not victim then return end
+                UIManager:show(ConfirmBox:new{
+                    text = string.format(_("删除提醒时间 %s？"), slotKey(victim)),
+                    ok_text = _("删除"),
+                    ok_callback = function()
+                        table.remove(current, slot_index)
+                        setReminderTimes(current)
+                        self:scheduleReminder()
+                        if touchmenu_instance then
+                            touchmenu_instance:updateItems()
+                        end
+                    end,
+                    cancel_text = _("取消"),
+                })
+            end,
+        }
+    end
+    items[#items + 1] = {
+        text = _("添加提醒时间"),
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            self:showReminderTimeDialog(touchmenu_instance)
+        end,
+    }
+    return items
 end
 
 -------------------------------------------------------------------------------
@@ -1423,48 +1866,11 @@ function Diary:onCloseWidget()
     UIManager:unschedule(self.reminder_cb)
 end
 
--- 单选项工厂（设置项均为 radio 形式）
-local function radioItem(text, key, value, on_change)
-    return {
-        text = text,
-        radio = true,
-        checked_func = function() return getSetting(key) == value end,
-        keep_menu_open = true,
-        callback = function()
-            setSetting(key, value)
-            if on_change then on_change() end
-        end,
-    }
-end
-
 function Diary:getSettingsMenu()
     return {
         {
-            text = _("回顾方式"),
-            separator = true,
-            sub_item_table = {
-                {
-                    text = _("分页单位"),
-                    sub_item_table = {
-                        radioItem(_("按天（一天一则）"), "page_unit", "day"),
-                        radioItem(_("按记录（一条时间戳一则）"), "page_unit", "record"),
-                    },
-                },
-                {
-                    text_func = function()
-                        return string.format(_("每页显示：%d 则"), getSetting("units_per_page"))
-                    end,
-                    sub_item_table = {
-                        radioItem(_("1 则"), "units_per_page", 1),
-                        radioItem(_("2 则"), "units_per_page", 2),
-                        radioItem(_("3 则"), "units_per_page", 3),
-                        radioItem(_("4 则"), "units_per_page", 4),
-                    },
-                },
-            },
-        },
-        {
             text = _("每日提醒"),
+            separator = true,
             sub_item_table = {
                 {
                     text = _("启用提醒"),
@@ -1480,13 +1886,10 @@ function Diary:getSettingsMenu()
                 },
                 {
                     text_func = function()
-                        return string.format(_("提醒时间：%s"), reminderTimeLabel())
+                        return string.format(_("提醒时间：%s"), reminderTimesLabel())
                     end,
                     enabled_func = function() return getSetting("reminder_enabled") end,
-                    keep_menu_open = true,
-                    callback = function(touchmenu_instance)
-                        self:showReminderTimeDialog(touchmenu_instance)
-                    end,
+                    sub_item_table_func = function() return self:getReminderTimesMenu() end,
                 },
                 {
                     text = _("今天已写过则不提醒"),
@@ -1501,7 +1904,24 @@ function Diary:getSettingsMenu()
                         end
                     end,
                 },
+                {
+                    text = _("一天最多提醒一次"),
+                    enabled_func = function() return getSetting("reminder_enabled") end,
+                    checked_func = function() return getSetting("reminder_once_per_day") end,
+                    keep_menu_open = true,
+                    callback = function(touchmenu_instance)
+                        setSetting("reminder_once_per_day",
+                            not getSetting("reminder_once_per_day"))
+                        if touchmenu_instance then
+                            touchmenu_instance:updateItems()
+                        end
+                    end,
+                },
             },
+        },
+        {
+            text = _("导出为一个 Markdown 文件"),
+            sub_item_table_func = function() return self:getExportMenu() end,
         },
     }
 end
