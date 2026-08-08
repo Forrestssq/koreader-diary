@@ -14,8 +14,10 @@
      一次，另可选「今天已写过则不提醒」「一天最多提醒一次」。
   6. 导出：把选定时间段（默认全部）的日记拼成一个大 Markdown 文件。
   7. 自动记录阅读：每天 23:59 自动记一条「今日阅读」（每本书的时长/页数 +
-     合计），数据取自 KOReader 自带 statistics 插件的库。到点时没开着就在
-     下次打开时补记。这类条目带一个隐形标记，不计入「连续记日记天数」。
+     合计），数据取自 KOReader 自带 statistics 插件的库；当天有书被标记
+     「已读完」的话，另起一段写上总页数与累计用时（书名从各书 sidecar 的
+     doc_props 取，不是文件名）。到点时没开着就在下次打开时补记。
+     这类条目带一个隐形标记，不计入「连续记日记天数」。
 
 面向 KOReader v2026.03，Lua 5.1（LuaJIT）。仅依赖 KOReader 自带模块。
 所有接口均按 v2026.03 源码实际签名编写：
@@ -42,6 +44,10 @@
                                  SQ3.open(path, "ro") + set_busy_timeout；查 page_stat
                                  视图（它会把页码换算到书当前的总页数）
   - datetime.secondsToClockDuration(format, secs, withoutSeconds)  时长格式化
+  - docsettings / readhistory    读各书 sidecar 的 summary（读完状态 + 日期）、
+                                 doc_props（书名）、partial_md5_checksum（对上
+                                 statistics 库 book.md5）；书目从 ReadHistory 枚举
+  - util.hasCJKChar              中文书名用《》，其余用 Markdown 斜体
   - two_finger_swipe 手势 ges.direction == "south"（见 device/gesturedetector.lua）
 
 @module koplugin.Diary
@@ -64,6 +70,8 @@ local SQ3 = require("lua-ljsqlite3/init")
 local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local DocSettings = require("docsettings")
+local ReadHistory = require("readhistory")
 local datetime = require("datetime")
 local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local lfs = require("libs/libkoreader-lfs")
@@ -1869,23 +1877,135 @@ function Diary:getReadingStats(date_str)
     return stats
 end
 
--- 生成某天的摘要正文；当天没有阅读记录返回 nil。
+-- 中文书名用《》，其余（英文等）用 Markdown 斜体。
+-- 第二个返回值是书名和后面文字之间该不该加空格：《》自带边界，贴着写就行；
+-- 斜体的星号后面必须留个空格，不然「*Yes, PM*已读完」挤在一起很难看。
+local function formatBookTitle(title)
+    if util.hasCJKChar(title) then
+        return "《" .. title .. "》", ""
+    end
+    return "*" .. title .. "*", " "
+end
+
+-- 某天被标记「读完」的书。
+--
+-- 「读完」这个状态不在 statistics 库里，而在每本书自己的 sidecar 里：
+-- summary.status == "complete"，summary.modified 记着改成这个状态的日期
+-- （阅读器里的「标记为已读完」和文件浏览器里的状态按钮都会写这两个字段，
+-- 见 readerstatus.lua 和 filemanagerutil.saveSummary）。所以只能挨个翻
+-- sidecar。书目从 ReadHistory 来 —— statistics 插件自己枚举藏书时也是这么干的。
+--
+-- 书名取 doc_props.display_title：那是元数据里的书名，取不到才退回文件名。
+-- 文件名后面常带「（某某来源）」之类的括号，不适合直接写进日记。
+function Diary:getFinishedBooks(date_str)
+    local found = {}
+    for _, item in ipairs(ReadHistory.hist or {}) do
+        local file = item.file
+        if file and DocSettings:hasSidecarFile(file) then
+            local ok, info = pcall(function()
+                local ds = DocSettings:open(file)
+                local summary = ds:readSetting("summary")
+                if not summary or summary.status ~= "complete"
+                        or summary.modified ~= date_str then
+                    return nil
+                end
+                local props = ds:readSetting("doc_props") or {}
+                local stats = ds:readSetting("stats") or {}
+                return {
+                    title = props.display_title or props.title or stats.title,
+                    md5 = ds:readSetting("partial_md5_checksum"),
+                    pages = tonumber(stats.pages),
+                }
+            end)
+            if ok and info and info.title and info.title ~= "" then
+                found[#found + 1] = info
+            end
+        end
+    end
+    if #found > 0 then
+        self:fillBookTotals(found)
+    end
+    return found
+end
+
+-- 从 statistics 库补上每本书的总页数与总时长。
+-- sidecar 的 partial_md5_checksum 就是 book 表里的 md5，拿它当连接键。
+function Diary:fillBookTotals(books)
+    if lfs.attributes(STATS_DB, "mode") ~= "file" then
+        return
+    end
+    pcall(function()
+        local conn = SQ3.open(STATS_DB, "ro")
+        conn:set_busy_timeout(2000)
+        local stmt = conn:prepare([[
+            SELECT b.pages, sum(p.duration)
+            FROM   book b LEFT JOIN page_stat p ON p.id_book = b.id
+            WHERE  b.md5 = ?
+            GROUP  BY b.id;
+        ]])
+        for idx = 1, #books do
+            local b = books[idx]
+            if b.md5 then
+                local res, nb = stmt:reset():bind(b.md5):resultset("i")
+                if nb and nb > 0 then
+                    b.pages = tonumber(res[1][1]) or b.pages
+                    b.duration = tonumber(res[2][1])
+                end
+            end
+        end
+        stmt:close()
+        conn:close()
+    end)
+end
+
+-- 生成某天的摘要正文；当天既没阅读记录、也没读完的书，返回 nil。
 function Diary:buildReadingSummary(date_str)
     local stats = self:getReadingStats(date_str)
-    if not stats or #stats.books == 0 then
+    local finished = self:getFinishedBooks(date_str)
+    if not stats and #finished == 0 then
         return nil
     end
+
     local fmt = G_reader_settings:readSetting("duration_format")
-    local lines = { _("今日阅读"), "" }
-    for idx = 1, #stats.books do
-        local b = stats.books[idx]
-        lines[#lines + 1] = string.format(_("《%s》 %s · %d 页"),
-            b.title, datetime.secondsToClockDuration(fmt, b.duration, true), b.pages)
+    local blocks = {}
+
+    if stats then
+        local lines = { _("今日阅读"), "" }
+        for idx = 1, #stats.books do
+            local b = stats.books[idx]
+            -- 书名的写法和下面「已读完」那几行保持一致
+            lines[#lines + 1] = string.format(_("%s %s · %d 页"),
+                (formatBookTitle(b.title)),
+                datetime.secondsToClockDuration(fmt, b.duration, true), b.pages)
+        end
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = string.format(_("合计 %s · %d 页"),
+            datetime.secondsToClockDuration(fmt, stats.total_duration, true), stats.total_pages)
+        blocks[#blocks + 1] = table.concat(lines, "\n")
     end
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = string.format(_("合计 %s · %d 页"),
-        datetime.secondsToClockDuration(fmt, stats.total_duration, true), stats.total_pages)
-    return table.concat(lines, "\n")
+
+    if #finished > 0 then
+        local lines = {}
+        for idx = 1, #finished do
+            local b = finished[idx]
+            local shown, sep = formatBookTitle(b.title)
+            local line = shown .. sep .. _("已读完")
+            -- 页数/用时主要靠 statistics 库补。那本书没进过库（或者库里就是 0）
+            -- 时宁可不写，也别写出「页数 0」这种没意义的东西。
+            if b.pages and b.pages > 0 then
+                line = line .. string.format(_("，页数 %d"), b.pages)
+            end
+            if b.duration and b.duration > 0 then
+                line = line .. string.format(_("，用时 %s"),
+                    datetime.secondsToClockDuration(fmt, b.duration, true))
+            end
+            lines[#lines + 1] = line
+        end
+        blocks[#blocks + 1] = table.concat(lines, "\n")
+    end
+
+    -- 阅读统计和「读完」之间空一行隔开
+    return table.concat(blocks, "\n\n")
 end
 
 -- 当天是否已经有自动摘要了（幂等用；万一 last_summary_date 丢了也不会写重）。
