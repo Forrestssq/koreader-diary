@@ -12,6 +12,10 @@
   5. 每日提醒：可开关，可设多个时间点，到点弹窗提醒写日记（弹窗内直接带写
      入口）。若到点时 KOReader 没开着，下次打开时补弹；每个时间点一天只弹
      一次，另可选「今天已写过则不提醒」「一天最多提醒一次」。
+  6. 导出：把选定时间段（默认全部）的日记拼成一个大 Markdown 文件。
+  7. 自动记录阅读：每天 23:59 自动记一条「今日阅读」（每本书的时长/页数 +
+     合计），数据取自 KOReader 自带 statistics 插件的库。到点时没开着就在
+     下次打开时补记。这类条目带一个隐形标记，不计入「连续记日记天数」。
 
 面向 KOReader v2026.03，Lua 5.1（LuaJIT）。仅依赖 KOReader 自带模块。
 所有接口均按 v2026.03 源码实际签名编写：
@@ -34,6 +38,10 @@
   - libs/libkoreader-lfs         lfs.attributes / lfs.mkdir / lfs.dir
   - apps/filemanager/filemanagerutil     getDefaultDir()
   - luasettings / datastorage    插件自己的设置文件 settings/diary.lua
+  - lua-ljsqlite3/init           只读 settings/statistics.sqlite3（statistics 插件的库）
+                                 SQ3.open(path, "ro") + set_busy_timeout；查 page_stat
+                                 视图（它会把页码换算到书当前的总页数）
+  - datetime.secondsToClockDuration(format, secs, withoutSeconds)  时长格式化
   - two_finger_swipe 手势 ges.direction == "south"（见 device/gesturedetector.lua）
 
 @module koplugin.Diary
@@ -52,11 +60,14 @@ local InputDialog = require("ui/widget/inputdialog")
 local LuaSettings = require("luasettings")
 local Menu = require("ui/widget/menu")
 local QRMessage = require("ui/widget/qrmessage")
+local SQ3 = require("lua-ljsqlite3/init")
 local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local datetime = require("datetime")
 local filemanagerutil = require("apps/filemanager/filemanagerutil")
 local lfs = require("libs/libkoreader-lfs")
+local logger = require("logger")
 local util = require("util")
 local _ = require("gettext")
 local Screen = Device.screen
@@ -74,6 +85,16 @@ local CATCHUP_DELAY = 3
 -- QR 码 8-bit 模式的容量上限是 2953 字节，留一点余量。
 local QR_MAX_BYTES = 2900
 
+-- 自动生成的阅读摘要的隐形标记：正文第一行。Markdown 注释渲染时不显示，
+-- 读进来时会被剥掉，所以只有「连续记日记天数」看得见它。
+local AUTO_MARKER = "<!-- diary:reading -->"
+-- 自动摘要的时间戳：一天的末尾
+local SUMMARY_TIME = "23:59:00"
+-- statistics 插件的库。本插件只读，不写。
+local STATS_DB = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
+-- 首次启用时最多往回补几天，免得扫太久
+local SUMMARY_CATCHUP_DAYS = 60
+
 -------------------------------------------------------------------------------
 -- 设置（模块级单例：插件在 FileManager ↔ ReaderUI 之间会被重新实例化）
 -------------------------------------------------------------------------------
@@ -87,17 +108,25 @@ local DEFAULTS = {
     reminder_skip_if_written = true, -- 今天已写过则静默跳过
     reminder_once_per_day = false,   -- 一天弹过一次之后，剩下的时间点都不再弹
     -- reminder_last：{ ["21:00"] = "YYYY-MM-DD" }，每个时间点各记各的
-    export_range = "all",       -- all / 7d / 30d / month / custom
+    export_range = "all",       -- all / since_last / 7d / 30d / month / custom
     -- export_from / export_to：字符串 "YYYY-MM-DD"，仅 custom 用
+    -- last_export_to：上次导出到哪一天（那次实际导出的最后一天），since_last 用
+    -- last_export_name / last_export_at：上次用的文件名与时间，只用来显示
+    reading_summary_enabled = true, -- 每天 23:59 自动记一条「今日阅读」
+    -- last_summary_date：字符串 "YYYY-MM-DD"，已经写到哪一天了
+    -- summary_backfill_done：一次性回填是否用过
 }
 
--- 导出范围的可选项（顺序即菜单顺序）
+-- 导出范围的可选项（顺序即菜单顺序）。
+-- since_last 的标签要带上「上次导出到哪天」，那是运行期才知道的，
+-- 由 exportRangeLabelFor 负责补上。
 local EXPORT_RANGES = {
-    { id = "all",    label = _("全部") },
-    { id = "7d",     label = _("最近 7 天") },
-    { id = "30d",    label = _("最近 30 天") },
-    { id = "month",  label = _("本月") },
-    { id = "custom", label = _("自定义日期") },
+    { id = "all",        label = _("全部") },
+    { id = "since_last", label = _("上次导出之后") },
+    { id = "7d",         label = _("最近 7 天") },
+    { id = "30d",        label = _("最近 30 天") },
+    { id = "month",      label = _("本月") },
+    { id = "custom",     label = _("自定义日期") },
 }
 
 local diary_store
@@ -373,10 +402,12 @@ end
 
 -- 把一条记录放到指定的日期+时间。给了 old_date/old_rec_index 就先把原处那条
 -- 摘掉，于是「改时间戳」和「改日期」都变成同一个操作：搬家。
+-- auto 为真表示这是自动生成的阅读摘要；改动已有记录时会沿用原来的标记，
+-- 否则用户手动编辑一下自动摘要，它就悄悄变成手写条目、混进连续天数里了。
 -- 成功返回 true, date_str；失败返回 false, err。
-function Diary:placeRecord(text, date_str, time_str, old_date, old_rec_index)
+function Diary:placeRecord(text, date_str, time_str, old_date, old_rec_index, auto)
     text = trim(text)
-    local rec = { time = time_str, text = text }
+    local rec = { time = time_str, text = text, auto = auto or nil }
 
     if old_date and old_date == date_str then
         -- 同一天内挪动：一次读改写就够了
@@ -384,6 +415,7 @@ function Diary:placeRecord(text, date_str, time_str, old_date, old_rec_index)
         if not records or not records[old_rec_index] then
             return false, _("这条日记已经不在了。")
         end
+        rec.auto = rec.auto or records[old_rec_index].auto
         table.remove(records, old_rec_index)
         insertSorted(records, rec)
         local ok, err = self:writeDayRecords(date_str, records)
@@ -396,6 +428,7 @@ function Diary:placeRecord(text, date_str, time_str, old_date, old_rec_index)
         if not old_records or not old_records[old_rec_index] then
             return false, _("这条日记已经不在了。")
         end
+        rec.auto = rec.auto or old_records[old_rec_index].auto
         table.remove(old_records, old_rec_index)
         local ok, err = self:writeDayRecords(old_date, old_records)
         if not ok then
@@ -432,6 +465,10 @@ function Diary:writeDayRecords(date_str, records)
         -- 手工编辑出来的、本来就没有时间戳的记录，写回时也不硬加时间戳。
         if rec.time then
             parts[#parts + 1] = "## " .. rec.time .. "\n\n"
+        end
+        -- 自动摘要写回时把标记加回去（Markdown 注释，渲染时不显示）
+        if rec.auto then
+            parts[#parts + 1] = AUTO_MARKER .. "\n"
         end
         -- 行尾补两个空格，Markdown 渲染时才会真的换行而不是拼成一段
         parts[#parts + 1] = addHardBreaks(rec.text) .. "\n\n"
@@ -823,8 +860,15 @@ function Diary:parseDayRecords(date_str)
         local rec = parsed[_idx]
         -- 存进去的强制换行标记（行尾两个空格）在这里剥掉，上层拿到的是干净文本
         local text = trim(stripHardBreaks(table.concat(rec.lines, "\n")))
+        -- 自动生成的阅读摘要，正文第一行是个 Markdown 注释标记。同样剥掉：
+        -- 编辑器、阅读界面、导出文件都不该看见它，只有连续天数需要知道。
+        local auto = false
+        if text:sub(1, #AUTO_MARKER) == AUTO_MARKER then
+            auto = true
+            text = trim(text:sub(#AUTO_MARKER + 1))
+        end
         if text ~= "" then
-            records[#records + 1] = { time = rec.time, text = text }
+            records[#records + 1] = { time = rec.time, text = text, auto = auto or nil }
         end
     end
     return records
@@ -1336,11 +1380,29 @@ end
 -- 4) 连续记日记天数
 -------------------------------------------------------------------------------
 
-function Diary:showStreak()
+-- 「真的写了字」的日子：至少有一条不是自动阅读摘要的记录。
+-- 只看了书、由插件自动记了一条的日子不算打卡。
+-- 代价是每个日记文件都要解析一遍（原来只列目录），文件都很小，可以接受。
+function Diary:collectWrittenDays()
     local list = self:collectEntries()
+    local out = {}
+    for idx = 1, #list do
+        local records = self:parseDayRecords(list[idx].str) or {}
+        for r = 1, #records do
+            if not records[r].auto then
+                out[#out + 1] = list[idx]
+                break
+            end
+        end
+    end
+    return out
+end
+
+function Diary:showStreak()
+    local list = self:collectWrittenDays()
     if #list == 0 then
         UIManager:show(InfoMessage:new{
-            text = _("还没有任何日记。"),
+            text = _("还没有手写过日记。"),
         })
         return
     end
@@ -1416,6 +1478,13 @@ function Diary:getExportRange()
         return shiftDate(today, -29), today
     elseif mode == "month" then
         return today:sub(1, 8) .. "01", today
+    elseif mode == "since_last" then
+        local last = getSetting("last_export_to")
+        if not last then
+            return nil, nil -- 还没导出过，等于「全部」
+        end
+        -- 上次导出的最后一天之后，不设上界：接着上次往后导，一天都不漏
+        return shiftDate(last, 1), nil
     elseif mode == "custom" then
         local from, to = getSetting("export_from"), getSetting("export_to")
         -- 顺手兜一下反着填的情况
@@ -1441,11 +1510,23 @@ function Diary:collectEntriesInRange(from, to)
     return out
 end
 
+-- since_last 的标签要把「上次导出到哪天」写进括号里，别的照原样。
+local function exportRangeLabelFor(id, label)
+    if id ~= "since_last" then
+        return label
+    end
+    local last = getSetting("last_export_to")
+    if not last then
+        return string.format(_("%s（还没导出过，等于全部）"), label)
+    end
+    return string.format(_("%s（%s 之后）"), label, last)
+end
+
 function Diary:exportRangeLabel()
     local mode = getSetting("export_range")
     for _idx = 1, #EXPORT_RANGES do
         if EXPORT_RANGES[_idx].id == mode then
-            return EXPORT_RANGES[_idx].label
+            return exportRangeLabelFor(mode, EXPORT_RANGES[_idx].label)
         end
     end
     return _("全部")
@@ -1463,6 +1544,25 @@ function Diary:ensureCustomRange()
     end
 end
 
+-- 用户可以自己起名字，所以得挡住路径穿越和空名字。
+local function sanitizeFileName(name)
+    name = trim(name or "")
+    name = name:gsub("[/\\]", "_")   -- 不许跨目录
+    name = name:gsub("_+", "_")      -- 上一步可能留下一串下划线，收一收
+    -- 开头的点和下划线一起剥干净。分两次剥的话，"../../x" 会先变成 "_.._x"、
+    -- 剥掉下划线又露出点来，最后落成一个隐藏文件。
+    name = name:gsub("^[%._]+", "")
+    name = name:gsub("[%._]+$", "")
+    name = trim(name)
+    if name == "" then
+        return nil
+    end
+    if name:sub(-3):lower() ~= ".md" then
+        name = name .. ".md"
+    end
+    return name
+end
+
 function Diary:doExport()
     -- 自定义模式下起止一定要有值，否则 getExportRange 会退化成「全部」，
     -- 用户按了「现在导出」却导出了一切，很意外。
@@ -1472,10 +1572,66 @@ function Diary:doExport()
     local from, to = self:getExportRange()
     local dates = self:collectEntriesInRange(from, to)
     if #dates == 0 then
-        UIManager:show(InfoMessage:new{ text = _("所选范围内没有日记。") })
+        UIManager:show(InfoMessage:new{
+            text = getSetting("export_range") == "since_last"
+                and _("上次导出之后还没有新日记。")
+                or _("所选范围内没有日记。"),
+        })
         return
     end
 
+    -- 先让用户确认/改文件名，默认就是这次的日期范围
+    local default_name = string.format("diary-export-%s_%s", dates[1], dates[#dates])
+    local input
+    input = InputDialog:new{
+        title = _("导出文件名"),
+        input = default_name,
+        description = string.format(
+            _("共 %d 天（%s ~ %s），导出到 home 目录。\n不用写 .md，会自动加上。"),
+            #dates, dates[1], dates[#dates]),
+        buttons = {
+            {
+                {
+                    text = _("取消"),
+                    id = "close",
+                    callback = function() UIManager:close(input) end,
+                },
+                {
+                    text = _("导出"),
+                    is_enter_default = true,
+                    callback = function()
+                        local name = sanitizeFileName(input:getInputText())
+                        if not name then
+                            UIManager:show(InfoMessage:new{ text = _("文件名不能为空。") })
+                            return
+                        end
+                        UIManager:close(input)
+                        self:confirmAndWriteExport(dates, name)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(input)
+    input:onShowKeyboard()
+end
+
+-- 同名文件已经在了就先问一声，免得把别的东西盖掉。
+function Diary:confirmAndWriteExport(dates, name)
+    local path = self:getHomeDir() .. "/" .. name
+    if lfs.attributes(path, "mode") == "file" then
+        UIManager:show(ConfirmBox:new{
+            text = string.format(_("%s 已经存在，要覆盖吗？"), name),
+            ok_text = _("覆盖"),
+            ok_callback = function() self:writeExport(dates, name) end,
+            cancel_text = _("取消"),
+        })
+        return
+    end
+    self:writeExport(dates, name)
+end
+
+function Diary:writeExport(dates, name)
     local parts = {
         "# " .. _("日记导出") .. "\n\n",
         string.format(_("范围：%s ~ %s\n"), dates[1], dates[#dates]),
@@ -1501,8 +1657,7 @@ function Diary:doExport()
     end
     parts[range_line_idx] = string.format(_("共 %d 天 / %d 条\n"), #dates, total_records)
 
-    local path = string.format("%s/diary-export-%s_%s.md",
-        self:getHomeDir(), dates[1], dates[#dates])
+    local path = self:getHomeDir() .. "/" .. name
     local ok, err = writeFileAtomic(path, table.concat(parts))
     if not ok then
         UIManager:show(InfoMessage:new{
@@ -1510,6 +1665,12 @@ function Diary:doExport()
         })
         return
     end
+
+    -- 记下这次导出到哪一天，下次「上次导出之后」就从它的次日接着来。
+    -- 记的是这次实际导出的最后一天，不是今天 —— 导的是一段旧日期时也对得上。
+    setSetting("last_export_to", dates[#dates])
+    setSetting("last_export_name", name)
+    setSetting("last_export_at", stampLabel(nowStamp()))
 
     UIManager:show(InfoMessage:new{
         text = string.format(_("已导出 %d 天 / %d 条到：\n%s"), #dates, total_records, path),
@@ -1541,7 +1702,8 @@ function Diary:getExportMenu()
     for _idx = 1, #EXPORT_RANGES do
         local r = EXPORT_RANGES[_idx]
         range_items[#range_items + 1] = {
-            text = r.label,
+            -- since_last 的标签里带着日期，日期会变，所以用 text_func
+            text_func = function() return exportRangeLabelFor(r.id, r.label) end,
             radio = true,
             checked_func = function() return getSetting("export_range") == r.id end,
             keep_menu_open = true,
@@ -1586,6 +1748,44 @@ function Diary:getExportMenu()
         },
         {
             text_func = function()
+                local last = getSetting("last_export_to")
+                if not last then
+                    return _("上次导出：还没导出过")
+                end
+                return string.format(_("上次导出：到 %s（%s）"),
+                    last, getSetting("last_export_name") or "?")
+            end,
+            enabled_func = function() return getSetting("last_export_to") ~= nil end,
+            keep_menu_open = true,
+            separator = true,
+            -- 点一下看详情，长按可以清掉重来
+            callback = function()
+                UIManager:show(InfoMessage:new{
+                    text = string.format(_("上次导出\n\n到：%s\n文件：%s\n时间：%s\n\n长按本项可清除这个记录。"),
+                        getSetting("last_export_to"),
+                        getSetting("last_export_name") or "?",
+                        getSetting("last_export_at") or "?"),
+                })
+            end,
+            hold_callback = function(touchmenu_instance)
+                UIManager:show(ConfirmBox:new{
+                    text = _("清除「上次导出」的记录吗？\n清除后「上次导出之后」会等同于「全部」。"),
+                    ok_text = _("清除"),
+                    ok_callback = function()
+                        getStore():delSetting("last_export_to")
+                        getStore():delSetting("last_export_name")
+                        getStore():delSetting("last_export_at")
+                        getStore():flush()
+                        if touchmenu_instance then
+                            touchmenu_instance:updateItems()
+                        end
+                    end,
+                    cancel_text = _("取消"),
+                })
+            end,
+        },
+        {
+            text_func = function()
                 local from, to = self:getExportRange()
                 return string.format(_("现在导出（%d 天）"),
                     #self:collectEntriesInRange(from, to))
@@ -1596,6 +1796,295 @@ function Diary:getExportMenu()
             end,
         },
     }
+end
+
+-------------------------------------------------------------------------------
+-- 7) 每天自动记一条「今日阅读」
+--
+-- 数据来自 KOReader 自带 statistics 插件的 SQLite 库。它没有给别的插件留 API
+-- （既没有事件也没有全局对象），既有做法就是直接读它的库 —— exporter.koplugin
+-- 的 xmnote target 也是这么干的。本插件只读，绝不写。
+-------------------------------------------------------------------------------
+
+-- 某天的零点与次日零点。day+1 交给 os.time 归一化，别用 t0+86400：跨夏令时会错。
+local function dayBounds(date_str)
+    local y, m, d = date_str:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
+    if not y then return nil end
+    y, m, d = tonumber(y), tonumber(m), tonumber(d)
+    return os.time({ year = y, month = m, day = d, hour = 0, min = 0, sec = 0 }),
+           os.time({ year = y, month = m, day = d + 1, hour = 0, min = 0, sec = 0 })
+end
+
+-- 查某天读了哪些书。返回 { books = {{title=,pages=,duration=}, ...},
+-- total_pages =, total_duration = }；没有库、没有数据、或查询出错都返回 nil。
+function Diary:getReadingStats(date_str)
+    if lfs.attributes(STATS_DB, "mode") ~= "file" then
+        return nil -- statistics 插件没启用过
+    end
+    local t0, t1 = dayBounds(date_str)
+    if not t0 then return nil end
+
+    -- 整个 DB 访问包在 pcall 里：statistics 换了 schema、库损坏、SQLITE_BUSY，
+    -- 都只该让「今天没摘要」，不该把日记功能带崩。
+    local ok, stats = pcall(function()
+        -- 只读打开，不会因为路径写错而新建出一个空库，也不去抢写锁
+        local conn = SQ3.open(STATS_DB, "ro")
+        -- statistics 的 insertDB 会短暂持写锁，非 WAL 的老 Kindle 上会撞上
+        conn:set_busy_timeout(2000)
+        -- 用 page_stat 视图而不是 page_stat_data 表：视图会把页码换算到书当前的
+        -- 总页数，这样页数和 statistics 界面里显示的一致。
+        local stmt = conn:prepare([[
+            SELECT b.title, count(DISTINCT p.page), sum(p.duration)
+            FROM   page_stat p JOIN book b ON b.id = p.id_book
+            WHERE  p.start_time >= ? AND p.start_time < ?
+            GROUP  BY b.id
+            ORDER  BY sum(p.duration) DESC;
+        ]])
+        local res, nb = stmt:reset():bind(t0, t1):resultset("i")
+        stmt:close()
+        conn:close()
+
+        local books, total_pages, total_duration = {}, 0, 0
+        for i = 1, (nb or 0) do
+            local pages = tonumber(res[2][i]) or 0
+            local duration = tonumber(res[3][i]) or 0
+            books[#books + 1] = {
+                title = tostring(res[1][i] or _("未知书名")),
+                pages = pages,
+                duration = duration,
+            }
+            total_pages = total_pages + pages
+            total_duration = total_duration + duration
+        end
+        return { books = books, total_pages = total_pages, total_duration = total_duration }
+    end)
+
+    if not ok then
+        logger.warn("diary: 读取阅读统计失败:", stats)
+        return nil
+    end
+    if #stats.books == 0 then
+        return nil
+    end
+    return stats
+end
+
+-- 生成某天的摘要正文；当天没有阅读记录返回 nil。
+function Diary:buildReadingSummary(date_str)
+    local stats = self:getReadingStats(date_str)
+    if not stats or #stats.books == 0 then
+        return nil
+    end
+    local fmt = G_reader_settings:readSetting("duration_format")
+    local lines = { _("今日阅读"), "" }
+    for idx = 1, #stats.books do
+        local b = stats.books[idx]
+        lines[#lines + 1] = string.format(_("《%s》 %s · %d 页"),
+            b.title, datetime.secondsToClockDuration(fmt, b.duration, true), b.pages)
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = string.format(_("合计 %s · %d 页"),
+        datetime.secondsToClockDuration(fmt, stats.total_duration, true), stats.total_pages)
+    return table.concat(lines, "\n")
+end
+
+-- 当天是否已经有自动摘要了（幂等用；万一 last_summary_date 丢了也不会写重）。
+function Diary:hasReadingSummary(date_str)
+    local records = self:parseDayRecords(date_str)
+    if not records then return false end
+    for idx = 1, #records do
+        if records[idx].auto then return true end
+    end
+    return false
+end
+
+-- 给某天写一条摘要。已经有了、或当天没读书，都返回 false（不算失败）。
+function Diary:writeReadingSummary(date_str)
+    if self:hasReadingSummary(date_str) then
+        return false
+    end
+    local text = self:buildReadingSummary(date_str)
+    if not text then
+        return false
+    end
+    local ok, err = self:placeRecord(text, date_str, SUMMARY_TIME, nil, nil, true)
+    if not ok then
+        logger.warn("diary: 写入阅读摘要失败:", err)
+        return false
+    end
+    return true
+end
+
+-- statistics 每 50 次翻页才落一次库，正在看书时直接查会漏掉最近几页。
+-- 插件按 name 注册在 self.ui 上，能拿到就先让它落盘一次。
+function Diary:flushReadingStats()
+    local stats = self.ui and self.ui.statistics
+    if stats and type(stats.insertDB) == "function" then
+        pcall(function() stats:insertDB() end)
+    end
+end
+
+-- 重排下一次摘要，并把错过的日子补上。
+-- 和提醒一样：UIManager 跑在 CLOCK_MONOTONIC 上，休眠期间不走时，
+-- 所以每次 onResume 都要按墙钟重算。
+function Diary:scheduleSummary()
+    UIManager:unschedule(self.summary_cb)
+    if not getSetting("reading_summary_enabled") then
+        return
+    end
+
+    local now = os.time()
+    local today = os.date("%Y-%m-%d", now)
+    local last = getSetting("last_summary_date")
+
+    if not last then
+        -- 首次启用不回填历史：从昨天算起，只管今天以后。
+        -- 历史交给设置里那个一次性的「补记历史阅读」。
+        setSetting("last_summary_date", shiftDate(today, -1))
+        last = getSetting("last_summary_date")
+    end
+
+    -- 今天的 23:59 是否已经过了（slotTarget 定义在后面的提醒小节里，这里自己算）
+    local today_due_t = os.date("*t", now)
+    today_due_t.hour, today_due_t.min, today_due_t.sec = 23, 59, 0
+    local today_is_due = now >= os.time(today_due_t)
+
+    -- 把 last 之后、已经过了 23:59 的日子逐个补上
+    local cursor = shiftDate(last, 1)
+    local guard = 0
+    while cursor <= today and guard < SUMMARY_CATCHUP_DAYS do
+        guard = guard + 1
+        if cursor == today and not today_is_due then break end
+        if cursor == today then
+            self:flushReadingStats()
+        end
+        self:writeReadingSummary(cursor)
+        setSetting("last_summary_date", cursor)
+        cursor = shiftDate(cursor, 1)
+    end
+
+    -- 排下一次：今天写过了就排明天，否则排今天 23:59
+    local t = os.date("*t", now)
+    if getSetting("last_summary_date") >= today then
+        t.day = t.day + 1
+    end
+    t.hour, t.min, t.sec = 23, 59, 0
+    UIManager:scheduleIn(math.max(os.time(t) - now, 1), self.summary_cb)
+end
+
+function Diary:fireSummary()
+    local today = os.date("%Y-%m-%d")
+    self:flushReadingStats()
+    if self:writeReadingSummary(today) then
+        self:refreshOpenViews()
+    end
+    setSetting("last_summary_date", today)
+    self:scheduleSummary() -- 排到明天
+end
+
+-- 设置里的「立即记录今天」：手动跑一次，并且把结果说清楚。
+function Diary:summarizeTodayNow()
+    local today = os.date("%Y-%m-%d")
+    self:flushReadingStats()
+    if self:hasReadingSummary(today) then
+        UIManager:show(InfoMessage:new{ text = _("今天已经记过一条阅读摘要了。") })
+        return
+    end
+    local text = self:buildReadingSummary(today)
+    if not text then
+        UIManager:show(InfoMessage:new{
+            text = lfs.attributes(STATS_DB, "mode") ~= "file"
+                and _("没找到阅读统计数据。\n请先启用 KOReader 自带的「统计」插件。")
+                or _("今天还没有阅读记录。"),
+        })
+        return
+    end
+    if self:writeReadingSummary(today) then
+        setSetting("last_summary_date", today)
+        self:refreshOpenViews()
+        UIManager:show(InfoMessage:new{ text = _("已记录：\n\n") .. text })
+    end
+end
+
+-- 一次性回填：只补「那天本来就写过日记」的历史日子。
+function Diary:backfillReadingSummaries()
+    local list = self:collectEntries() -- 这本身就是「写过日记的日子」
+    local today = os.date("%Y-%m-%d")
+    local candidates = {}
+    for idx = 1, #list do
+        local date_str = list[idx].str
+        if date_str < today and not self:hasReadingSummary(date_str)
+                and self:buildReadingSummary(date_str) then
+            candidates[#candidates + 1] = date_str
+        end
+    end
+
+    if #candidates == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("没有需要补记的日子。\n（只补那些当天写过日记、又有阅读记录的日子。）"),
+        })
+        setSetting("summary_backfill_done", true)
+        return
+    end
+
+    UIManager:show(ConfirmBox:new{
+        text = string.format(
+            _("要给这 %d 天补上阅读摘要吗？\n\n只补那些当天写过日记、又有阅读记录的日子。\n补完这个功能就会消失。"),
+            #candidates),
+        ok_text = _("补记"),
+        ok_callback = function()
+            local done = 0
+            for idx = 1, #candidates do
+                if self:writeReadingSummary(candidates[idx]) then
+                    done = done + 1
+                end
+            end
+            setSetting("summary_backfill_done", true)
+            self:refreshOpenViews()
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("已补记 %d 天。"), done),
+            })
+        end,
+        cancel_text = _("取消"),
+    })
+end
+
+function Diary:getReadingSummaryMenu()
+    local items = {
+        {
+            text = _("每天 23:59 自动记一条"),
+            checked_func = function() return getSetting("reading_summary_enabled") end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                setSetting("reading_summary_enabled",
+                    not getSetting("reading_summary_enabled"))
+                self:scheduleSummary()
+                if touchmenu_instance then
+                    touchmenu_instance:updateItems()
+                end
+            end,
+        },
+        {
+            text = _("立即记录今天"),
+            keep_menu_open = true,
+            callback = function() self:summarizeTodayNow() end,
+        },
+    }
+    -- 用过一次就不再出现
+    if not getSetting("summary_backfill_done") then
+        items[#items + 1] = {
+            text = _("补记历史阅读（仅一次）"),
+            keep_menu_open = true,
+            separator = true,
+            callback = function(touchmenu_instance)
+                self:backfillReadingSummaries()
+                if touchmenu_instance then
+                    touchmenu_instance:updateItems()
+                end
+            end,
+        }
+    end
+    return items
 end
 
 -------------------------------------------------------------------------------
@@ -1854,16 +2343,22 @@ function Diary:init()
     self.reminder_cb = function()
         self:fireReminder()
     end
+    self.summary_cb = function()
+        self:fireSummary()
+    end
     self:scheduleReminder()
+    self:scheduleSummary()
     self.ui.menu:registerToMainMenu(self)
 end
 
 function Diary:onResume()
     self:scheduleReminder()
+    self:scheduleSummary()
 end
 
 function Diary:onCloseWidget()
     UIManager:unschedule(self.reminder_cb)
+    UIManager:unschedule(self.summary_cb)
 end
 
 function Diary:getSettingsMenu()
@@ -1918,6 +2413,11 @@ function Diary:getSettingsMenu()
                     end,
                 },
             },
+        },
+        {
+            text = _("自动记录阅读"),
+            separator = true,
+            sub_item_table_func = function() return self:getReadingSummaryMenu() end,
         },
         {
             text = _("导出为一个 Markdown 文件"),
