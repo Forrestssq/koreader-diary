@@ -7,17 +7,24 @@
   2. 回顾日记：全屏列表按时间倒序逐条列出全部日记（带多行摘要），长按一条
      可选「编辑」或「生成二维码」；点开后进入全屏分页浏览器，一天一页，
      可一直往前/往后翻。
-  3. 日历查看：按月份的日历网格浏览，有日记的日子可点开查看。
-  4. 连续记日记天数：统计当前连续天数、历史最长与累计天数。
-  5. 每日提醒：可开关，可设多个时间点，到点弹窗提醒写日记（弹窗内直接带写
+  3. 搜索日记：按关键词（大小写不敏感）搜全部日记，命中的条目按时间倒序列出，
+     摘要从命中那一行起头；可勾选是否把自动记的「今日阅读」一起算进去。
+  4. 日历查看：按月份的日历网格浏览，有日记的日子可点开查看。
+  5. 连续记日记天数：统计当前连续天数、历史最长与累计天数。
+  6. 每日提醒：可开关，可设多个时间点，到点弹窗提醒写日记（弹窗内直接带写
      入口）。若到点时 KOReader 没开着，下次打开时补弹；每个时间点一天只弹
      一次，另可选「今天已写过则不提醒」「一天最多提醒一次」。
-  6. 导出：把选定时间段（默认全部）的日记拼成一个大 Markdown 文件。
-  7. 自动记录阅读：每天 23:59 自动记一条「今日阅读」（每本书的时长/页数 +
+  7. 导出：把选定时间段（默认全部）的日记拼成一个大 Markdown 文件。
+  8. 自动记录阅读：每天 23:59 自动记一条「今日阅读」（每本书的时长/页数 +
      合计），数据取自 KOReader 自带 statistics 插件的库；当天有书被标记
      「已读完」的话，另起一段写上总页数与累计用时（书名从各书 sidecar 的
      doc_props 取，不是文件名）。到点时没开着就在下次打开时补记。
      这类条目带一个隐形标记，不计入「连续记日记天数」。
+  9. 行内标记：全文页把 **x** 渲染成真加粗（TextBoxWidget 的 PTF 控制符），
+     ==x== 渲染成加粗的【x】，*x* 里的 ASCII 字母换成 Unicode 数学斜体字母
+     ——TextBoxWidget 只支持加粗，行内高亮和斜体都得这么绕。标记须同行成对
+     且紧贴内容。列表摘要里只是把标记符号去掉；编辑器、导出文件、二维码里
+     都是原始 Markdown。
 
 面向 KOReader v2026.03，Lua 5.1（LuaJIT）。仅依赖 KOReader 自带模块。
 所有接口均按 v2026.03 源码实际签名编写：
@@ -31,6 +38,12 @@
                                  所以每次都得新建一张按钮表。
   - ui/widget/menu               {covers_fullscreen=, multilines_show_more_text=,
                                   items_per_page=, onMenuSelect=, switchItemTable=}
+  - ui/widget/textboxwidget      PTF_HEADER / PTF_BOLD_START / PTF_BOLD_END：
+                                 文本首字符放 PTF_HEADER，中间用 BOLD_START/END
+                                 包住的片段就会加粗（合成粗体，不改字宽）。
+                                 只有加粗这一种效果，没有行内高亮/下划线。
+  - ui/widget/checkbutton        {text=, checked=, parent=, callback=}；
+                                 先 toggleCheck() 再回调，回调里读 .checked
   - ui/widget/buttondialog       {title=, buttons=（按钮网格）, dismissable, rows_per_page}
   - ui/widget/confirmbox         {text=, ok_text=, ok_callback=, cancel_text=}
   - ui/widget/datetimewidget     只传 hour/min 即为时分选择器；OK 回调收到 widget 本身
@@ -48,12 +61,15 @@
                                  doc_props（书名）、partial_md5_checksum（对上
                                  statistics 库 book.md5）；书目从 ReadHistory 枚举
   - util.hasCJKChar              中文书名用《》，其余用 Markdown 斜体
+  - util.stringLower             搜索用的 UTF-8 小写化
+  - util.unicodeCodepointToUtf8  拼 Unicode 数学斜体字母（U+1D434 / U+1D44E 区）
   - two_finger_swipe 手势 ges.direction == "south"（见 device/gesturedetector.lua）
 
 @module koplugin.Diary
 --]]--
 
 local ButtonDialog = require("ui/widget/buttondialog")
+local CheckButton = require("ui/widget/checkbutton")
 local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local DateTimeWidget = require("ui/widget/datetimewidget")
@@ -67,6 +83,7 @@ local LuaSettings = require("luasettings")
 local Menu = require("ui/widget/menu")
 local QRMessage = require("ui/widget/qrmessage")
 local SQ3 = require("lua-ljsqlite3/init")
+local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextViewer = require("ui/widget/textviewer")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -120,6 +137,7 @@ local DEFAULTS = {
     -- export_from / export_to：字符串 "YYYY-MM-DD"，仅 custom 用
     -- last_export_to：上次导出到哪一天（那次实际导出的最后一天），since_last 用
     -- last_export_name / last_export_at：上次用的文件名与时间，只用来显示
+    search_include_auto = false,    -- 搜索时是否把自动记的「今日阅读」也算进去
     reading_summary_enabled = true, -- 每天 23:59 自动记一条「今日阅读」
     -- last_summary_date：字符串 "YYYY-MM-DD"，已经写到哪一天了
     -- summary_backfill_done：一次性回填是否用过
@@ -894,17 +912,112 @@ local function renderRecords(records)
     return table.concat(parts, "\n\n")
 end
 
--- 回顾列表用的多行摘要：取前若干非空行，每行再截短。
-local function summarizeText(text)
-    local lines = {}
+-------------------------------------------------------------------------------
+-- 行内标记：**加粗**、==高亮==、*斜体*
+-------------------------------------------------------------------------------
+
+-- Unicode 数学字母的斜体区。TextBoxWidget 没有行内斜体，只能拿这些字符顶：
+-- 它们本身长得就是斜的，字体支持的话不用任何排版特性就能显示出来。
+local ITALIC_UPPER = 0x1D434 -- 𝐴
+local ITALIC_LOWER = 0x1D44E -- 𝑎
+-- 小写 h 的位置（U+1D455）在 Unicode 里是空的，官方指定用普朗克常数 ℎ 顶替
+local ITALIC_H = 0x210E
+
+-- 只转 ASCII 字母：数字没有斜体变体，中文更没有，原样留着。
+local function toMathItalic(s)
+    return (s:gsub("%a", function(ch)
+        local b = ch:byte()
+        if ch == "h" then
+            return util.unicodeCodepointToUtf8(ITALIC_H)
+        elseif b >= 65 and b <= 90 then      -- A-Z
+            return util.unicodeCodepointToUtf8(ITALIC_UPPER + b - 65)
+        else                                  -- a-z
+            return util.unicodeCodepointToUtf8(ITALIC_LOWER + b - 97)
+        end
+    end))
+end
+
+-- 扫描一行里的 **…** / ==…== / *…*，把每一段交给 fn(inner, kind) 换成别的写法。
+-- 逐行处理是故意的：标记不跨行，这样正文里孤零零的一个 ** 或 == 不会把
+-- 后面半篇日记都吞进去。
+-- 顺序也是有讲究的：先吃掉 **，剩下的单个 * 才可能是斜体。
+-- 按 Markdown 惯例：标记符号要紧贴内容才算数。这样 "a * b * c" 的乘号、
+-- 行首的 "* 列表项"、以及空标记（"****"、"===="）都会原样留着。
+local function markupInnerOk(inner)
+    return inner ~= "" and not inner:match("^%s") and not inner:match("%s$")
+end
+
+local function substInlineMarkup(text, fn)
+    local found = false
+    local out = {}
     for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        local function subst(str, pattern, kind)
+            return (str:gsub(pattern, function(inner)
+                if not markupInnerOk(inner) then return nil end
+                found = true
+                return fn(inner, kind)
+            end))
+        end
+        local rendered = subst(line, "%*%*(.-)%*%*", "bold")
+        rendered = subst(rendered, "==(.-)==", "highlight")
+        -- 单个星号最后处理：** 已经被吃掉了，剩下的成对 * 才可能是斜体
+        rendered = subst(rendered, "%*(.-)%*", "italic")
+        out[#out + 1] = rendered
+    end
+    return table.concat(out, "\n"), found
+end
+
+-- 全文页（TextViewer）用：加粗走 TextBoxWidget 的 PTF 控制符，是真加粗；
+-- 高亮和斜体它都渲染不了，分别退到【】和 Unicode 数学斜体字母。
+local function renderInlineMarkup(text)
+    local rendered, found = substInlineMarkup(text, function(inner, kind)
+        if kind == "italic" then
+            return toMathItalic(inner)
+        end
+        local bold = TextBoxWidget.PTF_BOLD_START .. inner .. TextBoxWidget.PTF_BOLD_END
+        return kind == "highlight" and ("【" .. bold .. "】") or bold
+    end)
+    if not found then
+        return text
+    end
+    -- 只在真插了 PTF 控制符时才加头：一段纯斜体不必平白多一个控制符
+    if not rendered:find(TextBoxWidget.PTF_BOLD_START, 1, true) then
+        return rendered
+    end
+    return TextBoxWidget.PTF_HEADER .. rendered
+end
+
+-- 列表 / 摘要用：Menu 会把条目文本里的 \n 换成空格再截断，掺控制符不安全；
+-- 数学斜体字母在这种压缩过的一行里也只会添乱。所以这里只是把标记符号去掉。
+local function stripInlineMarkup(text)
+    local rendered = substInlineMarkup(text, function(inner, kind)
+        return kind == "highlight" and ("【" .. inner .. "】") or inner
+    end)
+    return rendered
+end
+
+-- 回顾列表用的多行摘要：取前若干非空行，每行再截短。
+-- 给了 query（已小写）就改从命中那一行起头，搜索结果里才看得到自己搜的东西。
+local function summarizeText(text, query)
+    local all = {}
+    for line in (stripInlineMarkup(text) .. "\n"):gmatch("([^\n]*)\n") do
         local t = trim(line)
         if t ~= "" then
-            lines[#lines + 1] = truncateChars(t, SUMMARY_MAX_CHARS)
-            if #lines >= SUMMARY_MAX_LINES then
+            all[#all + 1] = t
+        end
+    end
+    local first = 1
+    if query and query ~= "" then
+        for idx = 1, #all do
+            if util.stringLower(all[idx]):find(query, 1, true) then
+                first = idx
                 break
             end
         end
+    end
+    local lines = {}
+    for idx = first, math.min(first + SUMMARY_MAX_LINES - 1, #all) do
+        lines[#lines + 1] = truncateChars(all[idx], SUMMARY_MAX_CHARS)
     end
     return table.concat(lines, "\n")
 end
@@ -930,6 +1043,10 @@ function Diary:getRecordUnits(list)
                 time = records[r].time,
                 title = records[r].time and (date_str .. " " .. records[r].time) or date_str,
                 text = records[r].text,
+                auto = records[r].auto,
+                -- 在这个全量数组里的下标。搜索结果是它的一个子集，编辑时要靠
+                -- 这个值回到 showEntryDialog 认的全局下标。
+                global_index = #units + 1,
             }
         end
     end
@@ -955,13 +1072,13 @@ function Diary:unitText(unit)
     return unit.text
 end
 
--- 一条记录一项。units 就是 getRecordUnits() 的结果，item.unit_index 与之对应，
--- 编辑时可以原样传给 showEntryDialog。
-function Diary:buildReviewItems(units)
+-- 一条记录一项。item.unit_index 是它在传进来的 units 里的下标（搜索结果就是
+-- 那份子集里的下标）；要回到编辑器认的全局下标得走 unit.global_index。
+function Diary:buildReviewItems(units, query)
     local item_table = {}
     for idx = 1, #units do
         local unit = units[idx]
-        local summary = summarizeText(unit.text)
+        local summary = summarizeText(unit.text, query)
         -- Menu 会把条目文本里的 \n 换成空格（menu.lua:211），所以摘要在这里
         -- 是一整段回流的文字；标题后面加个 · 把它和正文分开。
         item_table[#item_table + 1] = {
@@ -981,12 +1098,21 @@ function Diary:showReview()
         })
         return
     end
+    self:showUnitList(string.format(_("回顾日记（共 %d 条）"), #units), units)
+end
+
+-- 回顾列表和搜索结果共用的全屏列表。units 是 getRecordUnits() 的（子）集；
+-- query（已小写）只影响每项摘要从哪一行起头；search 记住这是哪次搜索的结果，
+-- 改完一条之后 refreshOpenViews 靠它重跑同一次搜索，而不是掉回全量列表。
+function Diary:showUnitList(title, units, query, search)
     self.review_units = units
-    local item_table = self:buildReviewItems(units)
+    self.review_query = query
+    self.review_search = search
+    local item_table = self:buildReviewItems(units, query)
 
     self.review_menu = Menu:new{
         name = "diary_review",
-        title = string.format(_("回顾日记（共 %d 条）"), #units),
+        title = title,
         item_table = item_table,
         covers_fullscreen = true,
         is_borderless = true,
@@ -1020,6 +1146,8 @@ function Diary:closeReview()
         UIManager:close(self.review_menu)
         self.review_menu = nil
         self.review_units = nil
+        self.review_query = nil
+        self.review_search = nil
     end
 end
 
@@ -1047,8 +1175,9 @@ function Diary:showRecordActions(item)
                     text = _("编辑"),
                     callback = function()
                         close()
-                        -- showEntryDialog 会自己重建 edit_units，下标与列表一致
-                        self:showEntryDialog(item.unit_index)
+                        -- showEntryDialog 会自己重建全量的 edit_units，所以这里
+                        -- 要给全局下标：搜索结果列表里的下标只在那一份子集里成立。
+                        self:showEntryDialog(unit.global_index or item.unit_index)
                     end,
                 },
             },
@@ -1097,6 +1226,103 @@ function Diary:showRecordQR(unit)
         width = Screen:getWidth(),
         height = Screen:getHeight(),
     })
+end
+
+-------------------------------------------------------------------------------
+-- 按关键词搜索
+-------------------------------------------------------------------------------
+
+-- 模块级：插件在 FileManager ↔ ReaderUI 之间会被重新实例化，放 self 上留不住。
+local last_search_query = ""
+
+-- 每次都从磁盘重新取一遍：改完一条之后 refreshOpenViews 也走这里。
+-- needle 必须是已经小写化的。
+function Diary:filterUnits(needle, include_auto)
+    local matches = {}
+    local units = self:getRecordUnits()
+    for idx = 1, #units do
+        local unit = units[idx]
+        if include_auto or not unit.auto then
+            -- 对去掉标记的正文匹配，「关**键**词」也能被「关键词」搜到
+            if util.stringLower(stripInlineMarkup(unit.text)):find(needle, 1, true) then
+                matches[#matches + 1] = unit
+            end
+        end
+    end
+    return matches
+end
+
+local function searchTitle(query, count)
+    return string.format(_("「%s」（%d 条）"), query, count)
+end
+
+-- 命中的条目按原顺序（时间倒序）列出来，和回顾列表长一个样。
+function Diary:runSearch(query, include_auto)
+    query = trim(query or "")
+    if query == "" then
+        return
+    end
+    last_search_query = query
+    local search = { query = query, needle = util.stringLower(query), include_auto = include_auto }
+    local matches = self:filterUnits(search.needle, include_auto)
+    if #matches == 0 then
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("没有找到包含「%s」的日记。"), query),
+        })
+        return
+    end
+    self:showUnitList(searchTitle(query, #matches), matches, search.needle, search)
+end
+
+function Diary:showSearchDialog()
+    local include_auto = getSetting("search_include_auto")
+
+    local function close()
+        if self.search_dialog then
+            UIManager:close(self.search_dialog)
+            self.search_dialog = nil
+        end
+    end
+
+    self.search_dialog = InputDialog:new{
+        title = _("搜索日记"),
+        input = last_search_query,
+        input_hint = _("输入关键词"),
+        buttons = {
+            {
+                {
+                    text = _("取消"),
+                    id = "close",
+                    callback = close,
+                },
+                {
+                    text = _("搜索"),
+                    is_enter_default = true,
+                    callback = function()
+                        local query = self.search_dialog:getInputText()
+                        close()
+                        self:runSearch(query, include_auto)
+                    end,
+                },
+            },
+        },
+    }
+    -- 勾选状态记进设置，下次打开搜索框保持不变。
+    -- CheckButton 自己先 toggleCheck() 再回调，所以这里读它的 checked 即可。
+    local check_auto
+    check_auto = CheckButton:new{
+        text = _("包含自动记录的阅读摘要"),
+        checked = include_auto,
+        parent = self.search_dialog,
+        callback = function()
+            include_auto = check_auto.checked
+            setSetting("search_include_auto", include_auto)
+        end,
+    }
+    self.search_dialog:addWidget(check_auto)
+
+    UIManager:show(self.search_dialog)
+    self.search_dialog:onShowKeyboard()
 end
 
 -------------------------------------------------------------------------------
@@ -1160,7 +1386,8 @@ function Diary:showPagerPage(page)
     self.pager = TextViewer:new{
         title = title,
         title_shrink_font_to_fit = true,
-        text = self:unitText(unit),
+        -- 这里才把 **粗** / ==亮== 变成真正的排版效果，文件里存的仍是原始 Markdown
+        text = renderInlineMarkup(self:unitText(unit)),
         -- 真·全屏：不传宽高的话 TextViewer 默认是「屏幕 - 30px」的内缩窗口。
         width = Screen:getWidth(),
         height = Screen:getHeight(),
@@ -1231,7 +1458,7 @@ function Diary:pickRecordToEdit(matches)
             {
                 -- 按钮是单行的：摘要压成一行并截短，各行长度接近才不会字号不一
                 text = prefix .. "  " .. truncateChars(
-                    (unit.text:gsub("%s+", " ")), PICKER_MAX_CHARS),
+                    (stripInlineMarkup(unit.text):gsub("%s+", " ")), PICKER_MAX_CHARS),
                 align = "left",
                 callback = function()
                     UIManager:close(self.pick_dialog)
@@ -1266,11 +1493,22 @@ end
 -- 改过 / 删过之后，把还开着的回顾列表和分页浏览器刷新一遍，免得看到旧内容。
 function Diary:refreshOpenViews()
     if self.review_menu then
-        local units = self:getRecordUnits()
-        self.review_units = units
-        local item_table = self:buildReviewItems(units)
-        self.review_menu:switchItemTable(
-            string.format(_("回顾日记（共 %d 条）"), #units), item_table, -1)
+        -- 搜索结果就重跑那次搜索，别让改完一条之后悄悄变回全量列表
+        local search = self.review_search
+        local units, title
+        if search then
+            units = self:filterUnits(search.needle, search.include_auto)
+            title = searchTitle(search.query, #units)
+        else
+            units = self:getRecordUnits()
+            title = string.format(_("回顾日记（共 %d 条）"), #units)
+        end
+        if #units == 0 then
+            self:closeReview()
+        else
+            self.review_units = units
+            self.review_menu:switchItemTable(title, self:buildReviewItems(units, self.review_query), -1)
+        end
     end
     if self.pager then
         local page = self.pager_page or 1
@@ -2450,6 +2688,8 @@ function Diary:onDispatcherRegisterActions()
         { category = "none", event = "DiaryNewEntry", title = _("新建日记条目"), general = true })
     Dispatcher:registerAction("diary_review",
         { category = "none", event = "DiaryReview", title = _("回顾日记"), general = true })
+    Dispatcher:registerAction("diary_search",
+        { category = "none", event = "DiarySearch", title = _("搜索日记"), general = true })
     Dispatcher:registerAction("diary_calendar",
         { category = "none", event = "DiaryCalendar", title = _("日记日历"), general = true })
     Dispatcher:registerAction("diary_streak",
@@ -2561,6 +2801,10 @@ function Diary:addToMainMenu(menu_items)
                 callback = function() self:showReview() end,
             },
             {
+                text = _("搜索日记"),
+                callback = function() self:showSearchDialog() end,
+            },
+            {
                 text = _("日历查看"),
                 callback = function() self:showCalendarToday() end,
             },
@@ -2586,6 +2830,11 @@ end
 
 function Diary:onDiaryReview()
     self:showReview()
+    return true
+end
+
+function Diary:onDiarySearch()
+    self:showSearchDialog()
     return true
 end
 
