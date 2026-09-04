@@ -25,11 +25,32 @@
      ——TextBoxWidget 只支持加粗，行内高亮和斜体都得这么绕。标记须同行成对
      且紧贴内容。列表摘要里只是把标记符号去掉；编辑器、导出文件、二维码里
      都是原始 Markdown。
+ 10. 输入框「⋮」菜单：标题栏左上角的菜单可在光标处插入四样东西——此刻正在
+     上的那节课、从课表里挑一个课程名（都取自 coursecal.koplugin，用「」
+     括起来）、当前正在读的书名，或从阅读历史里挑一个书名（书名格式和
+     「今日阅读」一致：《》/ 斜体）。「插入当前课程」按教学周 + 星期几 +
+     钟点算，下课后一小时内仍算「刚上的课」（日记基本都是课后才写的）；
+     这会儿没课就置灰。coursecal 没装或没启用时前两项置灰；文件浏览器一侧
+     没有「当前书」，「插入当前书名」置灰。
+ 11. 写日记一律竖屏：横屏下打开输入框会自动转成竖屏，关掉时转回原来的方向。
+     本来就是竖屏（含上下颠倒）时一动不动。
 
 面向 KOReader v2026.03，Lua 5.1（LuaJIT）。仅依赖 KOReader 自带模块。
 所有接口均按 v2026.03 源码实际签名编写：
   - dispatcher:registerAction(name, {category="none", event=..., title=..., <section>=true})
-  - ui/widget/inputdialog        fullscreen/allow_newline/buttons/getInputText/onShowKeyboard
+  - ui/widget/inputdialog        fullscreen/allow_newline/buttons/getInputText/onShowKeyboard；
+                                 rotation_enabled + onSetRotationMode(mode)：源码里那句
+                                 `if self.rotation_enabled` 注释写着「Text editor only」，
+                                 不开这个开关调了也没反应。它把进来前的方向记进
+                                 rotation_mode_backup（只记第一次）再 setRotationMode +
+                                 reinit()；reinit 会重新调一遍 init()（所以 DiaryInput
+                                 里按屏幕尺寸算的手势范围会跟着更新），末尾自带
+                                 setDirty("all", "flashui")
+                                 addTextToInput(text) → InputText:addChars(text)，在光标处
+                                 插入并置「已修改」标记（setInputText 会把该标记清掉，
+                                 插入不能用它）；title_bar_left_icon /
+                                 title_bar_left_icon_tap_callback 透传给 TitleBar，
+                                 做成左上角的「⋮」（同 texteditor.koplugin）
   - ui/widget/textviewer         {title=, text=, width=, height=, buttons_table=,
                                   add_default_buttons=, page_turn_callback_prev/next=}
                                  注意：TextViewer 没有 fullscreen 选项，不传宽高时
@@ -44,7 +65,12 @@
                                  只有加粗这一种效果，没有行内高亮/下划线。
   - ui/widget/checkbutton        {text=, checked=, parent=, callback=}；
                                  先 toggleCheck() 再回调，回调里读 .checked
-  - ui/widget/buttondialog       {title=, buttons=（按钮网格）, dismissable, rows_per_page}
+  - ui/widget/buttondialog       {title=, buttons=（按钮网格）, dismissable, rows_per_page,
+                                  shrink_unneeded_width=, modal=,
+                                  anchor=function() 返回一个 Geom，弹窗贴着它出现}
+                                 注意 tap_close_callback 只在点窗外/按返回键时调用，
+                                 按钮回调里的 UIManager:close 走不到它——所以和
+                                 DateTimeWidget 一样自己 extend 并覆盖 onCloseWidget
   - ui/widget/confirmbox         {text=, ok_text=, ok_callback=, cancel_text=}
   - ui/widget/datetimewidget     只传 hour/min 即为时分选择器；OK 回调收到 widget 本身
   - ui/widget/infomessage        {text=, timeout=}
@@ -60,6 +86,17 @@
   - docsettings / readhistory    读各书 sidecar 的 summary（读完状态 + 日期）、
                                  doc_props（书名）、partial_md5_checksum（对上
                                  statistics 库 book.md5）；书目从 ReadHistory 枚举
+  - resources/icons/mdlight/appbar.menu.svg  标题栏左上角的「⋮」图标
+  - coursecal.koplugin/coursecal_data.lua    课程表数据模块
+                                 { term=, courses={ {title=, wday=, start_min=, …} } }。
+                                 PluginLoader 会把每个已加载插件的目录挂进 package.path，
+                                 所以 coursecal 启用时 require("coursecal_data") 直接可用；
+                                 没装/没启用就 pcall 失败，菜单里那项置灰（装完要重启才认）
+  - coursecal.koplugin/coursecal_schedule.lua  教学周换算
+                                 Schedule.new(data) / :weekOf(ts)（学期前返回 0、学期后
+                                 返回 total_weeks+1）/ :coursesInWeek(week) → 按 wday
+                                 分组、组内按开始时间排好。注意它的 wday 是 1 = 周一，
+                                 os.date 的 wday 是 1 = 周日，取当天课表时要换算
   - util.hasCJKChar              中文书名用《》，其余用 Markdown 斜体
   - util.stringLower             搜索用的 UTF-8 小写化
   - util.unicodeCodepointToUtf8  拼 Unicode 数学斜体字母（U+1D434 / U+1D44E 区）
@@ -105,6 +142,14 @@ local SUMMARY_MAX_LINES = 4
 local SUMMARY_MAX_CHARS = 60
 -- 「改哪一条？」列表里每行摘要的字数上限（按钮是单行的，得短一些）
 local PICKER_MAX_CHARS = 14
+-- 「从历史记录选书名」的两道封顶。每本书都要开一次 sidecar（一次文件读加一次
+-- lua load），电纸书上全扫会明显卡一下，所以扫描和结果两头都限死。
+local HISTORY_SCAN_MAX = 40
+local HISTORY_PICK_MAX = 20
+-- 「插入当前课程」：下课之后多久还算「刚上的那节」。日记基本都是课后才写的，
+-- 严格只认「正在上课」的话，最想用的时刻反而用不了。课间最短 20 分钟，而且
+-- 正在上的课永远优先，所以这个窗口开到一小时也不会串到别的课上去。
+local COURSE_GRACE_MIN = 60
 -- 补弹提醒的延时：启动瞬间界面还在铺，稍等一下再弹
 local CATCHUP_DELAY = 3
 -- QR 码 8-bit 模式的容量上限是 2953 字节，留一点余量。
@@ -203,6 +248,21 @@ function DiaryDateTime:onCloseWidget()
     return DateTimeWidget.onCloseWidget(self)
 end
 
+-- 输入框里弹的按钮菜单。要 modal 的理由和上面那段一模一样（不然被键盘压在
+-- 下面），还键盘的时机也一样。ButtonDialog 自带的 tap_close_callback 只在点
+-- 窗外和按返回键时调用，按钮回调里的 UIManager:close 走不到它，所以统一挂在
+-- onCloseWidget 上——那是所有关闭路径的必经之地。
+local DiaryButtonDialog = ButtonDialog:extend{
+    modal = true,
+}
+
+function DiaryButtonDialog:onCloseWidget()
+    if self.on_dismiss then
+        self.on_dismiss()
+    end
+    return ButtonDialog.onCloseWidget(self)
+end
+
 -------------------------------------------------------------------------------
 -- 带「双指下滑退出」的全屏输入框
 -------------------------------------------------------------------------------
@@ -272,6 +332,16 @@ local function truncateChars(text, max_chars)
         kept[i] = chars[i]
     end
     return table.concat(kept) .. "…"
+end
+
+-- 中文书名用《》，其余（英文等）用 Markdown 斜体。
+-- 第二个返回值是书名和后面文字之间该不该加空格：《》自带边界，贴着写就行；
+-- 斜体的星号后面必须留个空格，不然「*Yes, PM*已读完」挤在一起很难看。
+local function formatBookTitle(title)
+    if util.hasCJKChar(title) then
+        return "《" .. title .. "》", ""
+    end
+    return "*" .. title .. "*", " "
 end
 
 local function trim(s)
@@ -605,11 +675,49 @@ function Diary:commitEntry(content, stamp)
     self:applyEntryState(found)
 end
 
+-- 写日记一律竖屏。横屏下这个全屏输入框只剩两三行高，键盘一弹正文基本看不见了；
+-- 而且日记多半是竖着拿着设备写的，进来还得先手动转一次很烦。
+--
+-- 用的是 InputDialog 自带的 onSetRotationMode（KOReader 自带的文本编辑器也走这条
+-- 路）：它会把进来之前的方向记进 rotation_mode_backup（只记第一次），再
+-- setRotationMode + reinit。关掉输入框时按这个备份转回去。
+--
+-- 不用 UIManager:broadcastEvent(Event:new("SetRotationMode", ...))：那条路会让
+-- ReaderView 弹一个「Rotation mode set to: …」的通知，开一次日记闪两回很吵。
+function Diary:forcePortrait()
+    local dialog = self.diary_input
+    if not dialog then
+        return
+    end
+    -- LinuxFB 那套常量：偶数是竖屏、奇数是横屏（readerview.lua 里也是这么判的）。
+    -- 已经竖着就别动——用户可能特意设成了「上下颠倒」，那也是竖屏。
+    if Screen:getRotationMode() % 2 == 0 then
+        return
+    end
+    dialog:onSetRotationMode(Screen.DEVICE_ROTATED_UPRIGHT)
+end
+
+function Diary:restoreRotation(mode)
+    if not mode or mode == Screen:getRotationMode() then
+        return
+    end
+    Screen:setRotationMode(mode)
+    -- 底下那层界面自始至终没重新布局过（全屏输入框把它整个盖住了），转回原来的
+    -- 方向之后尺寸自然又对上，不用给它补发 SetDimensions。但 UIManager 关窗时
+    -- 算出来的重绘区域是竖屏坐标下的，跟现在对不上，所以整屏刷一次。
+    UIManager:setDirty(nil, "full")
+end
+
 function Diary:closeEntryDialog()
     if self.diary_input then
+        -- 先记下来：关掉之后 self.diary_input 就没了
+        local restore = self.diary_input.rotation_mode_backup
         UIManager:close(self.diary_input)
         self.diary_input = nil
+        self:restoreRotation(restore)
     end
+    -- 书名列表是按输入框这一次打开缓存的，关掉就作废
+    self.book_pick_cache = nil
     if self.diary_changed then
         self.diary_changed = nil
         self:refreshOpenViews()
@@ -778,6 +886,15 @@ function Diary:showEntryDialog(start_index)
         condensed = true,      -- 全屏编辑器推荐布局
         allow_newline = true,  -- 允许换行（多行输入）
         cursor_at_end = false,
+        -- 标题栏左上角的「⋮」：插入课程名 / 书名（同 texteditor.koplugin 的做法，
+        -- InputDialog 会把这两个字段透传给 TitleBar）
+        -- InputDialog:onSetRotationMode 里有一道 `if self.rotation_enabled`
+        -- 的闸（源码注释写着「Text editor only」），不开这个开关它什么都不做
+        rotation_enabled = true,
+        title_bar_left_icon = "appbar.menu",
+        title_bar_left_icon_tap_callback = function()
+            self:showInsertMenu()
+        end,
         close_callback = function()
             self:confirmDiscard(function() self:closeEntryDialog() end)
         end,
@@ -834,6 +951,9 @@ function Diary:showEntryDialog(start_index)
         },
     }
     UIManager:show(self.diary_input)
+    -- 先摆正方向再弹键盘：forcePortrait 会走 InputDialog:reinit() 把整个对话框
+    -- 重新布局一遍，键盘还没上来时做这件事最干净。
+    self:forcePortrait()
     self.diary_input:onShowKeyboard()
 end
 
@@ -1020,6 +1140,384 @@ local function summarizeText(text, query)
         lines[#lines + 1] = truncateChars(all[idx], SUMMARY_MAX_CHARS)
     end
     return table.concat(lines, "\n")
+end
+
+-------------------------------------------------------------------------------
+-- 8) 输入框「⋮」菜单：在光标处插入课程名 / 书名
+--
+-- 键盘的收放沿用 DiaryDateTime 那一套（理由见文件上方那段说明），但这里会套
+-- 两层窗口（⋮ 菜单 → 选择器），所以把「欠着一次还键盘」做成一张令牌：挂起时
+-- 发一张，关窗时谁手上有谁还。菜单要开下一层之前，先把令牌上的 pending 摁灭，
+-- 等自己关干净了再摁回来传给下一层——否则外层一关键盘就弹回来，紧接着内层又
+-- 收走，闪一下不说，nextTick 和窗口栈还会互相打架。
+-------------------------------------------------------------------------------
+
+function Diary:suspendKeyboard()
+    local dialog = self.diary_input
+    if not (dialog and dialog:isKeyboardVisible()) then
+        return nil -- 本来就没键盘，不欠
+    end
+    dialog:onCloseKeyboard()
+    return { pending = true }
+end
+
+function Diary:resumeKeyboard(token)
+    if not (token and token.pending) then
+        return
+    end
+    token.pending = false
+    -- 等这个窗口真的从栈上摘掉了再放键盘，免得两边同时改窗口栈（同 showStampDialog）
+    UIManager:nextTick(function()
+        if self.diary_input then
+            self.diary_input:onShowKeyboard()
+        end
+    end)
+end
+
+-- 关掉这一层、开下一层，中间不让键盘弹回来。
+function Diary:chainKeyboard(token, close_fn, open_fn)
+    if token then token.pending = false end
+    close_fn() -- 这一关触发的 resumeKeyboard 因此是空操作
+    if token then token.pending = true end
+    open_fn(token)
+end
+
+-- 插到光标处。必须用 addTextToInput：setInputText 会把「已修改」标记清掉，
+-- 那样插完直接退出就不会弹「未保存」确认，改动会悄悄丢掉。
+function Diary:insertAtCursor(text)
+    local dialog = self.diary_input
+    if not (dialog and text and text ~= "") then
+        return
+    end
+    dialog:addTextToInput(text)
+end
+
+-- 课程名，取自 coursecal.koplugin 的课程表。
+--
+-- coursecal_data.lua 是个纯数据模块，PluginLoader 会把每个已加载插件的目录挂进
+-- package.path（pluginloader.lua），所以直接 require 就能拿到；没装或没启用就
+-- pcall 失败，菜单里那一项置灰。探测结果记在模块级变量里：require 只缓存成功的
+-- 那次，失败的每次都会重新走一遍文件查找，所以自己记一个 false。
+-- （装上 coursecal 之后要重启 KOReader 才认。）
+local course_names -- nil = 还没探过；false = 探过，没有；table = 去重后的课名
+local function getCourseNames()
+    if course_names ~= nil then
+        return course_names or nil
+    end
+    local ok, data = pcall(require, "coursecal_data")
+    if not ok or type(data) ~= "table" or type(data.courses) ~= "table" then
+        course_names = false
+        return nil
+    end
+    -- 同一门课一学期会出现好几条（「形势与政策-3」有 4 条），按课名去重。
+    -- 不重排：数据本身是按星期几、上课时间排好的，也就是课表顺序，最好找。
+    local names, seen = {}, {}
+    for _, c in ipairs(data.courses) do
+        local title = c.title
+        if type(title) == "string" and title ~= "" and not seen[title] then
+            seen[title] = true
+            names[#names + 1] = title
+        end
+    end
+    course_names = (#names > 0) and names or false
+    return course_names or nil
+end
+
+-- 课程表本体（带教学周换算）。和 getCourseNames 一样按需 require、失败记 false。
+-- coursecal_schedule 不依赖任何 KOReader 模块，单独 require 是安全的。
+local schedule -- nil = 还没探过；false = 探过，没有
+local function getSchedule()
+    if schedule ~= nil then
+        return schedule or nil
+    end
+    local ok_data, data = pcall(require, "coursecal_data")
+    local ok_sched, Schedule = pcall(require, "coursecal_schedule")
+    if not (ok_data and ok_sched and type(data) == "table") then
+        schedule = false
+        return nil
+    end
+    local ok, built = pcall(Schedule.new, data)
+    schedule = ok and built or false
+    return schedule or nil
+end
+
+--- 此刻这一节课。
+-- 第二个返回值：true = 正在上，false = 已经下课但还在 COURSE_GRACE_MIN 之内。
+-- 都没有就返回 nil（放假、周末、深夜、学期外）。
+function Diary:currentCourse()
+    local sched = getSchedule()
+    if not sched then
+        return nil
+    end
+    local now = os.date("*t")
+    -- weekOf 学期前返回 0、学期后返回 total_weeks + 1，两头都不算「有课」
+    local week = sched:weekOf(os.time())
+    if week < 1 or week > sched.term.total_weeks then
+        return nil
+    end
+    -- os.date 的 wday 是 1 = 周日，课表数据里是 1 = 周一，得换一下
+    local wday = (now.wday == 1) and 7 or (now.wday - 1)
+    local today = sched:coursesInWeek(week)[wday]
+    local minute = now.hour * 60 + now.min
+
+    for _, c in ipairs(today) do
+        if minute >= c.start_min and minute < c.end_min then
+            return c, true
+        end
+    end
+    -- 没在上课，就找刚下课不久的那一节。coursesInWeek 已按开始时间排好，
+    -- 顺着扫下去，最后留下的就是结束得最晚的那节。
+    local recent
+    for _, c in ipairs(today) do
+        if c.end_min <= minute and minute - c.end_min <= COURSE_GRACE_MIN then
+            recent = c
+        end
+    end
+    if recent then
+        return recent, false
+    end
+    return nil
+end
+
+-- 正在读的这本书。doc_props 只有阅读器那一侧才有，文件浏览器里没有「当前书」。
+function Diary:currentBookTitle()
+    local props = self.ui and self.ui.doc_props
+    local title = props and (props.display_title or props.title)
+    if type(title) == "string" and title ~= "" then
+        return title
+    end
+    return nil
+end
+
+-- 阅读历史里的书名。取法和 getFinishedBooks 一样（读 sidecar 里的 doc_props，
+-- 不是文件名），但不按「读完」和日期过滤。ReadHistory.hist 已经是最近读的在前。
+-- 每本书都要开一次 sidecar，所以两头封顶；同名只留一条（换过路径或重复导入的
+-- 书在历史里会出现好几次）。结果缓存到输入框关闭为止。
+function Diary:getHistoryBookTitles()
+    if self.book_pick_cache then
+        return self.book_pick_cache
+    end
+    local list, seen, scanned = {}, {}, 0
+    for _, item in ipairs(ReadHistory.hist or {}) do
+        if scanned >= HISTORY_SCAN_MAX or #list >= HISTORY_PICK_MAX then
+            break
+        end
+        local file = item.file
+        if file and DocSettings:hasSidecarFile(file) then
+            scanned = scanned + 1
+            local ok, title = pcall(function()
+                local ds = DocSettings:open(file)
+                local props = ds:readSetting("doc_props") or {}
+                local stats = ds:readSetting("stats") or {}
+                return props.display_title or props.title or stats.title
+            end)
+            if ok and type(title) == "string" and title ~= "" and not seen[title] then
+                seen[title] = true
+                list[#list + 1] = title
+            end
+        end
+    end
+    self.book_pick_cache = list
+    return list
+end
+
+function Diary:showInsertMenu()
+    local dialog = self.diary_input
+    if not dialog then
+        return
+    end
+    local token = self:suspendKeyboard()
+    local book_title = self:currentBookTitle()
+    local has_courses = getCourseNames() ~= nil
+    local now_course, in_session = self:currentCourse()
+
+    -- 按钮上直接写出是哪门课，省得点下去才知道插进来的是什么；
+    -- 措辞也顺带把「正在上」和「刚下课」区分开。
+    local now_label
+    if not now_course then
+        now_label = _("插入当前课程")
+    elseif in_session then
+        now_label = string.format(_("插入当前课程（%s）"),
+            truncateChars(now_course.title, PICKER_MAX_CHARS))
+    else
+        now_label = string.format(_("插入刚上的课（%s）"),
+            truncateChars(now_course.title, PICKER_MAX_CHARS))
+    end
+
+    local function closeMenu()
+        if self.insert_menu then
+            -- UIManager:close 会同步派发 onCloseWidget，所以这行返回时
+            -- on_dismiss 已经跑过了，chainKeyboard 里开关 pending 的顺序才成立。
+            UIManager:close(self.insert_menu)
+            self.insert_menu = nil
+        end
+    end
+
+    self.insert_menu = DiaryButtonDialog:new{
+        shrink_unneeded_width = true,
+        -- 贴着标题栏左上角那个图标弹出（同 texteditor.koplugin）
+        anchor = function()
+            return dialog.title_bar.left_button.image.dimen
+        end,
+        buttons = {
+            {
+                {
+                    text = now_label,
+                    align = "left",
+                    -- 这会儿没课（周末、假期、深夜、学期外）就置灰
+                    enabled = now_course ~= nil,
+                    callback = function()
+                        closeMenu()
+                        -- 置灰的按钮点不动，这里只是防着以后改动把它放出来
+                        if now_course then
+                            self:insertAtCursor("「" .. now_course.title .. "」")
+                        end
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("插入课程名"),
+                    align = "left",
+                    -- 没装 coursecal 就置灰，而不是把这一项藏掉：三项顺序恒定，
+                    -- 用户才不会以为功能丢了。
+                    enabled = has_courses,
+                    callback = function()
+                        self:chainKeyboard(token, closeMenu, function(t)
+                            self:showCoursePicker(t)
+                        end)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("插入当前书名"),
+                    align = "left",
+                    -- 文件浏览器里没有「当前书」，同样置灰。也不回退成「最近读的
+                    -- 那本」——那本并没在打开，名不副实，何况下面那项已经能选。
+                    enabled = book_title ~= nil,
+                    callback = function()
+                        -- 叶子动作：关掉菜单（on_dismiss 顺手把键盘放回来）再插入
+                        closeMenu()
+                        local shown, sep = formatBookTitle(book_title)
+                        self:insertAtCursor(shown .. sep)
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("从历史记录选书名"),
+                    align = "left",
+                    callback = function()
+                        self:chainKeyboard(token, closeMenu, function(t)
+                            self:showBookHistoryPicker(t)
+                        end)
+                    end,
+                },
+            },
+        },
+        on_dismiss = function()
+            self:resumeKeyboard(token)
+        end,
+    }
+    UIManager:show(self.insert_menu)
+end
+
+-- 课程选择器。去重后就十来条、每条几个字，ButtonDialog 一页八行两页翻完，
+-- 和「改哪一条？」长得一样，用户已经认识这个形状；全屏 Menu 对这点内容太重，
+-- 还会把正文整个盖掉、多一次全屏刷新。
+function Diary:showCoursePicker(token)
+    local names = getCourseNames()
+    if not names then
+        -- 菜单里那项本来就置灰了，这里只是兜底
+        UIManager:show(InfoMessage:new{
+            text = _("没找到课程表（需要装上并启用课程日历插件）。"),
+        })
+        self:resumeKeyboard(token)
+        return
+    end
+    local buttons = {}
+    for idx = 1, #names do
+        local name = names[idx]
+        buttons[idx] = {
+            {
+                -- 按钮是单行的，长课名截短显示；插进去的仍是完整课名
+                text = truncateChars(name, PICKER_MAX_CHARS),
+                align = "left",
+                callback = function()
+                    if self.insert_pick then
+                        UIManager:close(self.insert_pick)
+                        self.insert_pick = nil
+                    end
+                    self:insertAtCursor("「" .. name .. "」")
+                end,
+            },
+        }
+    end
+    self.insert_pick = DiaryButtonDialog:new{
+        title = _("插入哪门课？"),
+        title_align = "center",
+        buttons = buttons,
+        rows_per_page = 8,
+        on_dismiss = function()
+            self:resumeKeyboard(token)
+        end,
+    }
+    UIManager:show(self.insert_pick)
+end
+
+-- 历史书名选择器。这里用全屏 Menu 而不是 ButtonDialog：书名长且长短不一，单行
+-- 按钮会截到十四个字，好些书就只剩没法区分的前缀了；Menu 的
+-- multilines_show_more_text 会折行加缩字号（同「回顾日记」的列表）。
+--
+-- Menu 不是 modal 的，但没关系：它出现时键盘已经收起来了，栈里没有 modal 挡着。
+-- 这也正是选择器必须等 ⋮ 菜单关掉之后再 show 的原因，chainKeyboard 保证了顺序。
+function Diary:showBookHistoryPicker(token)
+    local titles = self:getHistoryBookTitles()
+    if #titles == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("阅读历史里还没有能用的书名。"),
+        })
+        self:resumeKeyboard(token)
+        return
+    end
+    local item_table = {}
+    for idx = 1, #titles do
+        item_table[idx] = { text = titles[idx], book_title = titles[idx] }
+    end
+
+    -- 选中一项和「返回键 / 点标题栏的 X」是两条不同的关闭路径，都得还键盘，
+    -- 所以合到一处。
+    local function done()
+        if not self.book_menu then
+            return
+        end
+        UIManager:close(self.book_menu)
+        self.book_menu = nil
+        self:resumeKeyboard(token)
+    end
+
+    self.book_menu = Menu:new{
+        title = _("插入哪本书的书名？"),
+        item_table = item_table,
+        covers_fullscreen = true,
+        is_borderless = true,
+        is_popout = false,
+        multilines_show_more_text = true,
+        items_per_page = 8,
+        is_enable_shortcut = false,
+        onMenuSelect = function(_menu, item)
+            local title = item.book_title
+            -- done() 里的还键盘走 nextTick，插入是同步的，所以插入一定发生在
+            -- 键盘回来之前，顺序是对的。
+            done()
+            local shown, sep = formatBookTitle(title)
+            self:insertAtCursor(shown .. sep)
+            return true
+        end,
+    }
+    self.book_menu.close_callback = done
+    UIManager:show(self.book_menu)
 end
 
 -------------------------------------------------------------------------------
@@ -2115,16 +2613,6 @@ function Diary:getReadingStats(date_str)
     return stats
 end
 
--- 中文书名用《》，其余（英文等）用 Markdown 斜体。
--- 第二个返回值是书名和后面文字之间该不该加空格：《》自带边界，贴着写就行；
--- 斜体的星号后面必须留个空格，不然「*Yes, PM*已读完」挤在一起很难看。
-local function formatBookTitle(title)
-    if util.hasCJKChar(title) then
-        return "《" .. title .. "》", ""
-    end
-    return "*" .. title .. "*", " "
-end
-
 -- 某天被标记「读完」的书。
 --
 -- 「读完」这个状态不在 statistics 库里，而在每本书自己的 sidecar 里：
@@ -2788,8 +3276,18 @@ end
 
 -- 主菜单 tools 分类下的一个子菜单。
 function Diary:addToMainMenu(menu_items)
+    -- 两个入口：一个点下去直接开写，一个是原来那个子菜单。
+    --
+    -- 键名决定它们在「工具」里的先后：插件的菜单项是「孤儿」，MenuSorter 用
+    -- FFIUtil.orderedPairs 按键名排序往里插（menusorter.lua）。"diary" 排在
+    -- "diary_plugin" 前面，所以「马上写日记」在上面。
     menu_items.diary = {
-        text = _("日记"),
+        text = _("马上写日记"),
+        sorting_hint = "tools",
+        callback = function() self:showEntryDialog() end,
+    }
+    menu_items.diary_plugin = {
+        text = _("日记插件"),
         sorting_hint = "tools",
         sub_item_table = {
             {
